@@ -1,0 +1,8 @@
+*
+
+!.gitignore
+!train.py
+!infer.py
+!run_all_variants.py
+!tests/
+!tests/train_*
