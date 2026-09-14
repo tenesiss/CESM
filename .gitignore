@@ -1,6 +1,8 @@
 *
 
 !.gitignore
+!requirements.txt
+!requirements-talkvid.txt
 !train.py
 !infer.py
 !run_all_variants.py
