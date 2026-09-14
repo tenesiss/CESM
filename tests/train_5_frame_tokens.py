@@ -8,8 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import train as trainer
 
 
-# CLI flags override these independent defaults, as in the other variants.
-# Only frames inside real token windows contribute to loss and CSV metrics.
+# CLI flags override these defaults. Cross entropy, confidence targets and CSV
+# metrics use real token windows; projection penalties also use unlabeled frames
+# in samples with supervision, and the full valid teacher text prefix.
 DEFAULTS = {
     "output": "checkpoints/test_5_frame_tokens.pt",
     "metrics_csv": "auto",

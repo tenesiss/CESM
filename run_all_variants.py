@@ -2,7 +2,7 @@
 """Prepare one TalkVid dataset, train all five variants, then evaluate the same samples.
 
 Use -N to download TalkVid, or --manifest to reuse a prepared dataset. Training
-options apply to all compatible variants; --variant-args provides per-test
+options apply to all compatible variants; --variant-args provides per-variant
 overrides. Each stage runs in its own process to release model/GPU memory.
 """
 

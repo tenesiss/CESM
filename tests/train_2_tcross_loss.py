@@ -8,8 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import train as trainer
 
 
-# Edit this script's defaults freely. CLI flags override these values.
-# The norm is over hidden features for each valid token (padding excluded).
+# CLI flags override these defaults. The penalty takes an L2 norm over hidden
+# features per query, including EOS and excluding padding.
 DEFAULTS = {
     "output": "checkpoints/test_2_tcross_loss.pt",
     "metrics_csv": "auto",
@@ -21,7 +21,7 @@ DEFAULTS = {
     "confidence_lr": 3e-4,
     "text_fusion": "residual",
     "lambda_tcross": 1.0,
-    "tcross_margin": 1.0,  # m; override with --tcross-margin
+    "tcross_margin": 1.0,  # m in the penalty above.
 }
 
 

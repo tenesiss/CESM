@@ -7,21 +7,21 @@ time. No future frame is read by the neural network before producing the current
 next-token distribution.
 
 Caches used during inference:
-  * causal Conv3D raw-frame history
+  * causal Conv3D input-frame history
   * video Conformer self-attention K/V per layer
   * video causal-convolution history per layer
   * text encoder self-attention K/V per layer
-  * Mixed Block text->video cross-attention K/V (grows per frame)
+  * Mixed Block text->video cross-attention K/V (non-frame variants only)
   * Mixed Block video->text cross-attention K/V (grows per committed token)
   * Mixed Block video-path self-attention K/V
 
 Token commitment is driven by the learned per-frame confidence head. The base
-confidence threshold can optionally relax as more frames pass since the previous
-commit, which prevents a low-confidence token from stalling the stream forever.
+confidence threshold can relax as more frames pass since the previous commit.
+Relaxation can reduce delays, but candidates must still reach the threshold floor
+and satisfy the warmup, frame-gap and optional probability/stability guards.
 While the same next-token candidate remains active, its peak confidence is kept;
-this lets a later relaxed threshold accept a confidence peak that occurred near
-the true boundary. A minimum token probability and candidate-stability count are
-available only as optional safety guards; confidence is the primary commit gate.
+this lets a later relaxed threshold accept an earlier peak. Confidence is trained
+from token entropy and future-distribution instability, not explicit boundaries.
 """
 
 from __future__ import annotations
@@ -37,8 +37,6 @@ import cv2
 import numpy as np
 import torch
 
-# train.py intentionally doubles as the model module so the requested prototype
-# remains exactly two scripts.
 from train import FixedMouthCropper, ModelConfig, UnnobaModel, tokenizer_from_state_dict
 
 
@@ -141,10 +139,9 @@ def main(args) -> None:
     cropper = FixedMouthCropper(mouth_size, use_face_detector=use_face_detector)
     state = model.init_stream_state()
 
-    # The first autoregressive query is BOS. It is encoded exactly once; while
-    # frames arrive we only rerun its Mixed-Block cross-attention query against
-    # the growing cached video K/V. The text self-attention cache is not touched
-    # again until a token is actually committed.
+    # Encode BOS once, then update text caches only after commits. Token-query
+    # variants reuse its query as video K/V grows; frame fusion queries the
+    # cached text from each arriving frame.
     bos = torch.tensor([tokenizer.bos_id], dtype=torch.long, device=device)
     with torch.inference_mode():
         state = model.stream_push_text_token(bos, state)
@@ -200,10 +197,8 @@ def main(args) -> None:
             warm = frame_idx + 1 >= args.warmup_frames
             probability_ok = tok_prob >= args.min_token_prob
 
-            # Track stability independently of confidence. Confidence may peak
-            # for one frame at the learned boundary, so dropping the candidate
-            # merely because the next frame is less confident would throw away
-            # exactly the signal we trained the head to produce.
+            # A transient confidence drop must not reset a stable candidate's
+            # peak. Changing argmax or failing the probability guard does reset it.
             if probability_ok:
                 if candidate == tok_id:
                     candidate_streak += 1
@@ -291,7 +286,7 @@ def main(args) -> None:
 
             if args.debug_every > 0 and frame_idx % args.debug_every == 0:
                 top_text = tokenizer.decode([tok_id]) if tok_id != tokenizer.eos_id else "<eos>"
-                # Mean attention position of the current next-token query.
+                # Expected video-frame index under text->video attention.
                 A = attn.mean(dim=1)[0, 0]  # [cached_frames]
                 positions = torch.arange(A.numel(), device=A.device, dtype=A.dtype)
                 mu = float((A * positions).sum().item())
@@ -312,10 +307,8 @@ def main(args) -> None:
 
     cap.release()
 
-    # Optional end-of-video greedy flush. This reuses the final video K/V cache;
-    # no video is recomputed. It is disabled by default because it is not truly
-    # streaming behavior, but it is useful when evaluating an under-confident
-    # early prototype.
+    # Optional greedy flush bypasses confidence using the final video K/V cache.
+    # Frame fusion is excluded: new token logits require a new video frame.
     if (model.cfg.text_fusion != "frame" and not ended
             and args.flush_tokens > 0 and len(emitted_ids) < args.max_tokens):
         with torch.inference_mode():

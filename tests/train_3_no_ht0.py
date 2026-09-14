@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import train as trainer
 
 
-# Edit this script's defaults freely. CLI flags override these values.
+# CLI flags override these defaults.
 # ht0 still supplies text attention queries; only its residual term is removed.
 DEFAULTS = {
     "output": "checkpoints/test_3_no_ht0.pt",

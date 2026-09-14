@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-First-pass trainer for the Unnoba prototype described in main(2).tex.
+Training and shared model definitions for the causal Unnoba video-to-text prototype.
 
 Data format (JSONL, one example per line):
     {"video": "clips/hello.mp4", "text": "hello",
@@ -11,20 +11,24 @@ By default the tokenizer is character-level, so windows[i] is the inclusive
 --pretrained-lm switches both tokenization and the causal text encoder to a
 Hugging Face causal LM.  Character windows are then merged using the fast
 tokenizer's offset mapping so every LM token retains causal video alignment.
-The EOS target is trained at the last frame automatically.
+Token-query variants add an EOS target at the final video frame. The frame-token
+variant supervises frames inside real token windows and does not train EOS.
 
 Core architecture:
-  fixed mouth ROI -> causal Conv3D -> frame-wise ResNet-ish encoder
-  -> sinusoidal positions -> causal Conformer-like stack
-  -> causal text encoder -> Mixed Block (two cross-attention paths)
-  -> token head + confidence head.
+  video: fixed mouth ROI -> causal Conv3D -> per-frame residual encoder
+         -> sinusoidal positions -> causal Conformer-like stack
+  text:  teacher token prefix -> causal text encoder
+  fusion: projected video/text states -> Mixed Block -> token/confidence heads
+
+Token-query variants use text->video attention for tokens and video->text
+attention for confidence. The frame-token variant uses video->text attention
+for both heads and has no text->video attention branch.
 
 Training has two stages:
-  1. first-pass token training with the losses in the document:
-     * token cross entropy
-     * video/text projection cosine-geometry preservation
-     * video/text projection norm preservation
-     * monotonic text->video attention loss
+  1. token or frame cross entropy, with configurable projection and attention
+     regularizers. By default, only projection norm penalties have nonzero
+     weights; geometry, monotonic attention, aligned-window attention and
+     tcross norm penalties are disabled.
   2. confidence training with the token path frozen, following the document's
      window/timestep equations directly. For every aligned token window, the
      frozen token predictor is evaluated at each frame using only the video
@@ -79,14 +83,14 @@ def seed_everything(seed: int) -> None:
 
 
 def autocast_activation(x: torch.Tensor) -> torch.Tensor:
-    """Use the active AMP storage dtype without changing FP32/FP64 execution."""
+    """Cast activations to the AMP dtype; preserve FP64 and non-AMP inputs."""
     if x.dtype != torch.float64 and torch.is_autocast_enabled(x.device.type):
         return x.to(dtype=torch.get_autocast_dtype(x.device.type))
     return x
 
 
 class AutocastGroupNorm(nn.GroupNorm):
-    """Keep normalization in FP32, then store its AMP output in low precision."""
+    """Use FP32 math and low-precision output under AMP, except for FP64 inputs."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype == torch.float64 or not torch.is_autocast_enabled(x.device.type):
@@ -101,7 +105,7 @@ class AutocastGroupNorm(nn.GroupNorm):
 
 
 class AutocastLayerNorm(nn.LayerNorm):
-    """LayerNorm with FP32 math and AMP output storage; checkpoint keys unchanged."""
+    """Use FP32 math under AMP except for FP64 inputs; keep LayerNorm state keys."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype == torch.float64 or not torch.is_autocast_enabled(x.device.type):
@@ -139,7 +143,7 @@ class ModelConfig:
 
 
 # -----------------------------------------------------------------------------
-# Prototype tokenizer
+# Character and pretrained tokenizers
 # -----------------------------------------------------------------------------
 
 
@@ -247,9 +251,8 @@ class HuggingFaceTokenizer:
         if tok.eos_token_id is None:
             tok.add_special_tokens({"eos_token": self._new_special_token("<|cesm_eos|>")})
         if tok.bos_token_id is None:
-            # Many decoder-only LMs conventionally use EOS as their initial
-            # context token. Preserve that pretrained embedding instead of
-            # introducing a random frozen BOS vector.
+            # Reuse EOS as initial context when BOS is absent, avoiding a
+            # separate BOS embedding.
             tok.bos_token = tok.eos_token
         if tok.pad_token_id is None or tok.pad_token_id in (tok.bos_token_id, tok.eos_token_id):
             tok.add_special_tokens({"pad_token": self._new_special_token("<|cesm_pad|>")})
@@ -368,11 +371,9 @@ class FixedMouthCropper:
     Prototype replacement for the document's landmark/smoothing/fixed-mouth-ROI
     front end.
 
-    The first detected face fixes one mouth rectangle for the sequence. This is
-    deliberately causal: inference never scans future frames to choose the crop.
-    If OpenCV's Haar detector misses the face, a lower-center fallback is used.
-
-    Swap this class for a landmark tracker without changing the model itself.
+    The first frame fixes the rectangle for the entire sequence, using its
+    largest detected face or a lower-center fallback. Detection is not retried
+    on later frames, so crop selection never reads future frames.
     """
 
     def __init__(self, size: int = 96, use_face_detector: bool = True):
@@ -486,7 +487,7 @@ def read_video_mouth_tensor(
 
 
 def count_video_frames(path: str) -> int:
-    """Index decodable frames without trusting container frame-count metadata."""
+    """Count successful frame grabs instead of using container frame-count metadata."""
     cap = cv2.VideoCapture(path)
     count = 0
     try:
@@ -531,12 +532,12 @@ def load_manifest(path: str) -> List[dict]:
 def repair_quantized_empty_windows(
     windows: Sequence[Tuple[int, int]],
 ) -> Tuple[List[Tuple[int, int]], int]:
-    """Give isolated zero-frame intervals one frame from an adjacent interval.
+    """Give repairable zero-frame intervals one frame from an adjacent interval.
 
     Timestamp-to-frame rounding can turn a valid sub-frame token interval into
     ``[start, start - 1]``.  Repair only that exact one-frame collapse, and only
     when an immediately adjacent, contiguous interval has more than one frame.
-    All other malformed alignments are left for the strict validation below.
+    Callers validate any remaining malformed alignments.
     """
     repaired = list(windows)
     repair_count = 0
@@ -554,8 +555,8 @@ def repair_quantized_empty_windows(
                 repair_count += 1
                 continue
 
-        # A collapsed final interval has no following frame to borrow.  Move
-        # the preceding interval's final frame into it instead.
+        # If the following interval cannot donate, try the preceding interval's
+        # final frame instead.
         if i > 0:
             prev_start, prev_end = repaired[i - 1]
             if prev_end == end and prev_end > prev_start:
@@ -586,7 +587,7 @@ class VideoTextWindowDataset(Dataset):
         self.sections: Optional[List[Tuple[int, int, int, int]]] = None
         if max_frames is not None:
             # Index before batching so batch_size counts sections, not videos.
-            # Only frame counts are retained; tensors are loaded on demand.
+            # Store section bounds and frame counts; load tensors on demand.
             self.sections = []
             frame_counts: Dict[str, int] = {}
             for row_idx, row in enumerate(self.rows):
@@ -708,8 +709,6 @@ class VideoTextWindowDataset(Dataset):
                     f"{row['video']}: window_unit='token' requires {len(token_ids)} windows, "
                     f"got {len(clean_windows)}"
                 )
-            # Token-aligned manifests are accepted as well, which is useful
-            # when alignments were generated with the same pretrained tokenizer.
             token_windows = clean_windows
         else:
             raise ValueError(
@@ -766,7 +765,8 @@ class VideoTextWindowDataset(Dataset):
         # target token t-1 and is created only after processing the final frame
         # of that token's window, so the video path may use it starting at the
         # following frame.
-        # Negative availability denotes text committed in earlier sections.
+        # Availability is relative to section start, so prior states can have
+        # negative times.
         text_available_at = [-start_frame] + [
             end + 1 - start_frame for _, end in all_token_windows[:teacher_end]
         ]
@@ -927,12 +927,12 @@ class MultiHeadAttention(nn.Module):
         allowed: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # q/k/v: [B,H,T,Dh]. allowed: [B,Tq,Tk] or [Tq,Tk], True=visible.
+        # q: [B,H,Tq,Dh]; k/v: [B,H,Tk,Dh]. allowed: [B,Tq,Tk] or
+        # [Tq,Tk], with True marking visible keys.
         if not need_weights:
-            # Let PyTorch dispatch to FlashAttention or its memory-efficient
-            # SDPA backend when available. Unlike the explicit path below this
-            # does not retain [B,H,Tq,Tk] scores and probabilities. The explicit
-            # implementation remains necessary when a loss consumes weights.
+            # SDPA chooses the available backend; fused backends avoid dense
+            # [B,H,Tq,Tk] scores/probabilities. Use the explicit path below when
+            # callers request attention weights.
             attn_mask = allowed
             if attn_mask is not None:
                 if attn_mask.ndim == 2:
@@ -1339,8 +1339,8 @@ class PretrainedLMTextEncoder(nn.Module):
 
     The LM head is intentionally discarded: CESM's Mixed Block remains the
     next-token predictor, while the pretrained transformer supplies contextual
-    text states. Full-sequence training and one-token streaming share the same
-    model and its native ``past_key_values`` cache.
+    text states. Full-sequence training disables caching; one-token streaming
+    uses the same model with its native ``past_key_values`` cache.
     """
 
     def __init__(self, cfg: ModelConfig, *, initialize_from_pretrained: bool):
@@ -1487,7 +1487,7 @@ class MixedBlock(nn.Module):
         return self.text_ln(ht0 + tcross)
 
     def frame_logits(self, hv0: torch.Tensor, vcross: torch.Tensor) -> torch.Tensor:
-        """Classify the current frame: ht0 participates only as video K/V."""
+        """Classify frames; projected text contributes through video->text attention."""
         ht = self.text_ln(hv0 + vcross)
         ht_hat = self.text_ffn_ln(ht + self.text_ffn(ht))
         return self.token_head(ht_hat)
@@ -1565,13 +1565,11 @@ class MixedBlock(nn.Module):
         flash_mono: bool = False,
         need_attention: bool = True,
     ) -> dict:
-        """Run only the branch used by the first-stage token objective.
+        """Run the token-query branch for non-frame variants.
 
-        The confidence/video branch is disconnected from every first-stage
-        loss. Building it there only retains an unused autograd graph (and, on
-        the next iteration, can briefly overlap that graph with the new one).
-        Skipping it does not change token logits, projection losses or
-        text-to-video attention.
+        These variants' video/confidence branch does not contribute to the
+        first-stage losses, so skip its unused graph. Frame fusion uses
+        forward_frame instead because video->text attention also predicts tokens.
         """
         hv0 = self.vproj(x_video)
         ht0 = self.project_text(x_text)
@@ -1728,7 +1726,7 @@ class UnnobaModel(nn.Module):
         max_f: int,
         max_t: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build only the masks consumed by the first-stage token branch."""
+        """Build validity and text->video masks for token-query variants."""
         device = video_lengths.device
         frames = torch.arange(max_f, device=device)
         toks = torch.arange(max_t, device=device)
@@ -1832,16 +1830,15 @@ def similarity_preservation_loss(x: torch.Tensor, y: torch.Tensor, lengths: torc
     for b, L in enumerate(lengths.tolist()):
         if L <= 0:
             continue
-        # Keep this cancellation-prone identity in FP32 even under autocast.
-        # Dividing each feature-space Gram matrix by L before squaring also
-        # keeps every reduction bounded and avoids half-precision overflow.
+        # Accumulate this cancellation-prone Gram identity in FP32 under AMP,
+        # and scale by L before the final squared-norm reductions.
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
             xb = F.normalize(x[b, :L].float(), dim=-1, eps=1e-6)
             yb = F.normalize(y[b, :L].float(), dim=-1, eps=1e-6)
-            # mean(||XX' - YY'||^2)
+            # ||XX' - YY'||_F^2 / L^2
             #   = ||X'X/L||_F^2 + ||Y'Y/L||_F^2 - 2||X'Y/L||_F^2.
-            # The largest tensors now depend on feature widths rather than
-            # sequence length: O(D^2) instead of O(L^2).
+            # Pairwise matrices scale with feature widths, O(D^2), rather than
+            # sequence length, O(L^2); normalized inputs still require O(L*D).
             inv_length = 1.0 / float(L)
             xx = (xb.transpose(0, 1) @ xb) * inv_length
             yy = (yb.transpose(0, 1) @ yb) * inv_length
@@ -1874,7 +1871,7 @@ def tcross_margin_loss(
     """Mean ReLU(m - ||tcross||_2)^2, excluding padding and including true EOS.
 
     L2 over features, averaged over all valid token queries.
-    Use FP32 under AMP (retain FP64 for numerical gradient checks).
+    Compute in FP32 regardless of AMP, retaining FP64 inputs for gradient checks.
     """
     if not math.isfinite(margin) or margin < 0:
         raise ValueError("tcross margin must be finite and >= 0")
@@ -1913,7 +1910,7 @@ def aligned_window_attention_loss(
     video_lengths: torch.Tensor,
     *, window_counts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Optional extra supervision, disabled by default because it is not in the draft."""
+    """Mean negative log attention mass inside real token windows; exclude EOS."""
     A = attn.mean(dim=1)
     vals = []
     counts = (text_lengths - 1).clamp_min(0) if window_counts is None else window_counts
@@ -2003,18 +2000,19 @@ def rearrange_frames_by_window_timestep(
 
     Args:
         frame_tensor: [B,F,...] tensor whose first temporal axis is video frame.
-        windows: [B,Wmax,2] inclusive absolute [start,end] frame indices.
+        windows: [B,Wmax,2] inclusive [start,end] indices into frame_tensor
+            (section-local when videos are split).
         window_counts: [B], number of real token windows for each example.
 
     Returns:
         packed: [B,Wmax,Tmax,...]
         valid: [B,Wmax,Tmax] boolean mask for non-padding timesteps
         b: [B,Wmax] final valid relative timestep (length-1), or -1 if padded
-        frame_index: [B,Wmax,Tmax] absolute frame index, -1 if padded
+        frame_index: [B,Wmax,Tmax] index into frame_tensor, -1 if padded
 
-    This is the explicit rearrangement requested by the confidence section:
-    video-frame quantities become (window i, relative timestep t) quantities
-    before U, D, Q, S and the confidence BCE are evaluated.
+    Frame indices become (window i, relative timestep t) coordinates. Confidence
+    training packs scalar logits here and computes token targets separately,
+    one window at a time.
     """
     if frame_tensor.ndim < 2:
         raise ValueError("frame_tensor must have shape [B,F,...]")
@@ -2054,7 +2052,7 @@ def frozen_next_token_logits_for_window(
     text_available_at: Optional[torch.Tensor] = None,
     text_lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Return the frozen streaming token logits for one aligned window."""
+    """Return per-frame token logits for one teacher-forced aligned window."""
     m = model.mixed
     if model.cfg.text_fusion == "frame":
         if text_available_at is None or text_lengths is None:
@@ -2093,12 +2091,13 @@ def frozen_next_token_logits_per_frame(
 ) -> torch.Tensor:
     """Evaluate the frozen token path at every frame belonging to a token window.
 
-    During window i the causal text prefix is fixed at teacher query i (BOS for
-    the first token, then the previously committed tokens). At relative timestep
-    t, that query is allowed to attend only through absolute frame start_i+t.
-    Thus each aligned frame gets the next-token distribution that streaming
-    inference would have had at that exact point, without modifying token-path
-    parameters during confidence fitting.
+    Token-query variants use the teacher query for window i, with video visible
+    through section-local frame start_i+t. Frame fusion instead queries the
+    teacher text states available at each frame. In evaluation mode these match
+    streaming with the same video context and commits at aligned boundaries;
+    live confidence-based commits can produce different text prefixes.
+
+    Callers control gradient tracking and freeze the model for confidence fitting.
 
     Returns token logits [B,F,V]. Frames outside supplied real-token windows are
     left at zero and are subsequently masked out by the window packer.
@@ -2146,7 +2145,8 @@ def document_confidence_targets(
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Implement U, D, Q, S and s=1-S from the document.
 
-    Y: [B,W,T,V] probabilities after token-temperature softmax.
+    Y: [B,W,T,V] probabilities after token-temperature softmax, clamped and
+        renormalized internally for stable logarithms.
     valid: [B,W,T] valid window timesteps.
     b: [B,W] final valid relative timestep for each window.
 
@@ -2175,8 +2175,8 @@ def document_confidence_targets(
     Q = torch.zeros(B, W, T, device=Y.device, dtype=Y.dtype)
 
     # D_{i,t,u} is Jensen-Shannon divergence between the distribution at t and
-    # the future distribution t+u. Q is the beta log-sum-exp using normalized
-    # non-negative w_u exactly as in the draft.
+    # the distribution t+u (including u=0). Q uses normalized offset weights,
+    # floored at eps before taking their logarithms.
     for bi in range(B):
         for wi in range(W):
             last = int(b[bi, wi].item())
@@ -2216,8 +2216,8 @@ def document_confidence_targets(
     # S = lambda U + (1-lambda) Q/log(2), then s = 1-S.
     Q_norm = Q / log2
     S = entropy_lambda * U + (1.0 - entropy_lambda) * Q_norm
-    # Both ingredients are theoretically bounded in [0,1]. Clamp only to absorb
-    # floating-point overshoot, not to change the objective.
+    # The exact normalized quantities lie in [0,1]. Clamp overshoot from
+    # floating-point arithmetic and the epsilon floor on log weights.
     S = S.clamp(0.0, 1.0)
     s = (1.0 - S).clamp(0.0, 1.0)
 
@@ -2242,11 +2242,9 @@ def windowed_document_confidence_targets(
 
     This is mathematically the same operation as constructing ``Y[B,F,V]``,
     packing it as ``Y[B,W,T,V]`` and calling
-    :func:`document_confidence_targets`. The window and vocabulary dimensions
-    never need to coexist in one dense allocation, however: windows are
-    disjoint and every target depends only on distributions from its own
-    window. Peak vocabulary storage therefore falls from ``B*W*T*V`` to
-    ``max_window_length*V``.
+    :func:`document_confidence_targets`. Each target depends only on distributions
+    from its own window, so peak vocabulary storage falls from ``B*W*T*V`` to
+    ``max_window_length*V`` without a dense allocation across all windows.
     """
     B, Fmax = x_video.shape[:2]
     valid, b, frame_index = build_window_layout(
@@ -2539,7 +2537,8 @@ def evaluate_samples(
     """One teacher-forced, unregularized metric row per original manifest row.
 
     Aggregate numerators and counts across sections, never section means.
-    Empty transcripts / samples without labeled frames have count=0 and blank means.
+    Samples without scored positions have count=0 and blank means. Empty
+    transcripts still score one EOS when include_eos=True in token-query variants.
     """
     model.eval()
     is_frame = model.cfg.text_fusion == "frame"
@@ -2550,7 +2549,8 @@ def evaluate_samples(
     for batch in loader:
         with torch.amp.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
             batch = move_batch(batch, device)
-            # SDPA avoids a full attention map; metric reductions below stay FP32.
+            # SDPA avoids returning attention weights. Metrics use at least
+            # FP32 probability math and FP64 sums.
             logits = model(batch, flash_mono=True, need_attention=False)["token_logits"]
         targets = batch["frame_targets"] if is_frame else batch["targets"]
         lengths = batch["video_lengths"] if is_frame else batch_query_lengths(batch)
@@ -2647,13 +2647,12 @@ def save_checkpoint(
 
 
 def _confidence_modules(model: UnnobaModel) -> List[nn.Module]:
-    # Exactly the video/confidence side after the shared frozen projections.
     m = model.mixed
     modules = [
         m.video_ln, m.video_self_norm, m.video_self,
         m.video_self_ln, m.video_ffn, m.video_ffn_ln, m.conf_head,
     ]
-    # In variant 5 video_cross now affects token logits and must stay frozen.
+    # In frame fusion video_cross also affects token logits and must stay frozen.
     return modules if model.cfg.text_fusion == "frame" else [m.video_cross, *modules]
 
 
@@ -2678,7 +2677,7 @@ def set_confidence_train_mode(model: UnnobaModel) -> None:
 
 
 def configure_token_stage(model: UnnobaModel) -> List[nn.Parameter]:
-    """Expose the token-stage parameters while respecting a frozen imported LM."""
+    """Enable model gradients except for a frozen imported LM."""
     for parameter in model.parameters():
         parameter.requires_grad_(True)
     if model.cfg.text_encoder_type == "pretrained_lm" and model.cfg.freeze_text_encoder:
@@ -2860,7 +2859,7 @@ def train(args) -> None:
         print("flash-mono: streamed pre-dropout attention losses; token attention uses SDPA")
 
     # ------------------------------------------------------------------
-    # Stage 1: next-token model. Confidence path is not part of this loss.
+    # Stage 1: token/frame prediction; confidence-only layers are not used.
     # ------------------------------------------------------------------
     if args.epochs > 0:
         token_params = configure_token_stage(model)
@@ -2875,7 +2874,6 @@ def train(args) -> None:
             sums: Dict[str, float] = {}
             n = 0
             for batch in loader:
-                # Silence/unfinished-token sections have no artificial EOS.
                 targets = batch["frame_targets"] if cfg.text_fusion == "frame" else batch["targets"]
                 if not (targets != args.pad_id).any():
                     continue
@@ -2958,9 +2956,9 @@ def train(args) -> None:
             total_mean_target = 0.0
             n = 0
             for batch in loader:
-                # A section may contain only silence or an unfinished token.
-                # Only real token windows train confidence; neither prior text
-                # context nor a true terminal EOS creates confidence targets.
+                # Token-query variants use windows that finish in this section;
+                # frame fusion also uses portions of unfinished token windows.
+                # Neither silence nor EOS creates confidence targets.
                 counts = batch["frame_window_counts"] if cfg.text_fusion == "frame" else batch_window_counts(batch)
                 if not (counts > 0).any():
                     continue
@@ -3081,7 +3079,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--w-t", type=float, default=1.0,
                    help="Fixed scalar w_t for weighted fusion (default: 1); resume restores the saved weight")
 
-    # Draft loss terms.
+    # Projection and attention regularizers.
     p.add_argument("--lambda-vproj", type=float, default=0.0)
     p.add_argument("--lambda-tproj", type=float, default=0.0)
     p.add_argument("--lambda-vnorm", type=float, default=0.01)
@@ -3094,17 +3092,13 @@ def build_argparser() -> argparse.ArgumentParser:
             "use pre-dropout probabilities and SDPA for token attention (default: dense weights)"
         ),
     )
-    # Extra alignment supervision is useful experimentally but off by default
-    # because it is not one of the explicit losses in the supplied draft.
     p.add_argument("--lambda-align", type=float, default=0.0)
     p.add_argument("--lambda-tcross", type=float, default=0.0,
                    help="Weight of ReLU(m - ||tcross||_2)^2; 0 disables the penalty")
     p.add_argument("--tcross-margin", type=float, default=1.0, metavar="M",
                    help="Nonnegative threshold m for the tcross norm penalty")
 
-    # Second-stage confidence training. The token path is frozen. Per-frame token
-    # predictions/confidences are packed to [window,timestep] and the draft's
-    # U -> D -> Q -> S -> s -> BCE equations are applied directly.
+    # Confidence-stage optimization and target parameters.
     p.add_argument("--confidence-epochs", type=int, default=5)
     p.add_argument("--confidence-lr", type=float, default=3e-4)
     p.add_argument("--confidence-beta", type=float, default=10.0,

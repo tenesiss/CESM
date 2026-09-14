@@ -1,10 +1,14 @@
 *
 
+!README.md
 !.gitignore
 !requirements.txt
 !requirements-talkvid.txt
 !train.py
 !infer.py
 !run_all_variants.py
+!grouper.py
+!train_talkvid.py
+!flash_mono.py
 !tests/
 !tests/train_*

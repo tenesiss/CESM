@@ -9,8 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import train as trainer
 
 
-# Edit this script's defaults freely. CLI flags override these values.
-# Any option from train.py can be added here using its underscore name.
+# CLI flags override these defaults; keys use train.py's argparse destination names.
 DEFAULTS = {
     "output": "checkpoints/test_1_as_is.pt",
     "metrics_csv": "auto",

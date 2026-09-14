@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import train as trainer
 
 
-# Edit this script's defaults freely. CLI flags override these values.
+# CLI flags override these defaults.
 # w_t is a checkpointed buffer, never an optimizer parameter.
 DEFAULTS = {
     "output": "checkpoints/test_4_weighted_ht0.pt",
@@ -21,7 +21,7 @@ DEFAULTS = {
     "confidence_lr": 3e-4,
     "text_fusion": "weighted",
     "lambda_tcross": 0.0,
-    "w_t": 1.0,  # Override with --w-t; 1.0 reproduces the original fusion.
+    "w_t": 1.0,  # 1.0 reproduces the original fusion.
 }
 
 
