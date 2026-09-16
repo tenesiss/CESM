@@ -426,46 +426,47 @@ def save_grouped_frames(
     frame_index = 0
     group_index = 0
     assigned_frames = 0
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)] if ext in {"jpg", "jpeg"} else []
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-        # Advance through every token whose group has started. Using <= here
-        # means equal start frames are resolved in favor of the later token.
-        while (
-            group_index + 1 < len(group_starts)
-            and group_starts[group_index + 1] <= frame_index
-        ):
-            group_index += 1
+            # Advance through every token whose group has started. Using <= here
+            # means equal start frames are resolved in favor of the later token.
+            while (
+                group_index + 1 < len(group_starts)
+                and group_starts[group_index + 1] <= frame_index
+            ):
+                group_index += 1
 
-        if spans and frame_index <= last_speech_end_frame:
-            chosen = spans[group_index]
-            out_path = (
-                output_dir
-                / chosen.folder
-                / f"frame_{frame_index:09d}.{ext}"
-            )
-
-            if ext in {"jpg", "jpeg"}:
-                written = cv2.imwrite(
-                    str(out_path),
-                    frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)],
+            if spans and frame_index <= last_speech_end_frame:
+                chosen = spans[group_index]
+                out_path = (
+                    output_dir
+                    / chosen.folder
+                    / f"frame_{frame_index:09d}.{ext}"
                 )
-            else:
-                written = cv2.imwrite(str(out_path), frame)
 
-            if not written:
-                cap.release()
-                raise RuntimeError(f"Failed to write frame: {out_path}")
+                try:
+                    # OpenCV's imwrite cannot reliably open Unicode paths on
+                    # Windows (e.g. a tokenizer's ĠThis folder). Let OpenCV
+                    # encode the image and Python handle the filesystem path.
+                    encoded_ok, encoded = cv2.imencode(f".{ext}", frame, encode_params)
+                    if not encoded_ok:
+                        raise RuntimeError(f"Failed to encode frame: {out_path}")
+                    out_path.write_bytes(encoded.tobytes())
+                except (cv2.error, OSError) as exc:
+                    raise RuntimeError(f"Failed to write frame: {out_path}: {exc}") from exc
 
-            assigned_frames += 1
+                assigned_frames += 1
 
-        frame_index += 1
+            frame_index += 1
+    finally:
+        cap.release()
 
-    cap.release()
     frames_decoded = frame_index
 
     groups = _build_inclusive_groups(spans, fps, frames_decoded)

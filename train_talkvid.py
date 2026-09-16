@@ -15,9 +15,11 @@ import importlib.util
 import io
 import json
 import math
+import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -479,6 +481,33 @@ def cached_download(clip, args):
     return None
 
 
+def run_download_process(command, *, stdout, timeout):
+    """Stop yt-dlp and its FFmpeg children before removing temporary files."""
+    with subprocess.Popen(command, stdout=stdout, stderr=subprocess.STDOUT,
+                          start_new_session=os.name != "nt") as process:
+        try:
+            code = process.wait(timeout=timeout)
+        except BaseException:
+            try:
+                if os.name == "nt":
+                    # Killing only yt-dlp leaves FFmpeg downloading with the
+                    # staging files open, also breaking temporary-file cleanup.
+                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=10, check=False)
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+            raise
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+
+
 def download_clip(clip, args):
     folder = download_folder(clip, args)
     folder.mkdir(parents=True, exist_ok=True)
@@ -519,11 +548,16 @@ def download_clip(clip, args):
                 command.extend([flag, str(value)])
         for runtime in download_runtimes(args):
             command.extend(["--js-runtimes", runtime])
+        # yt-dlp's socket timeout does not apply to external FFmpeg downloads.
+        # Limit network reads on EVERY input, including the audio stream.
+        # FFmpeg 8.1 can inherit a large TCP read-ahead threshold and drain
+        # megabytes of a remote MP4 before seeking. Force real HTTP seeks;
+        # the socket timeout alone cannot stop a slow but active transfer.
+        command.extend(["--downloader-args", "ffmpeg_i:-rw_timeout 30000000 -short_seek_size 1"])
         command.extend(["--", clip.url])
         try:
             with log.open("w", encoding="utf-8") as stream:
-                subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
-                               check=True, timeout=args.download_timeout)
+                run_download_process(command, stdout=stream, timeout=args.download_timeout)
             probe_video(output, clip.end - clip.start, max_frames=args.download_max_frames)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             if isinstance(exc, subprocess.CalledProcessError):

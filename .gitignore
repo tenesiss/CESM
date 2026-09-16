@@ -12,3 +12,4 @@
 !flash_mono.py
 !tests/
 !tests/train_*
+!tests/test_download_recovery.py

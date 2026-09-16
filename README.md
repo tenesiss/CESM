@@ -128,6 +128,23 @@ previous final manifest, and saves the new partial rows as `data.jsonl.partial`
 (or `MANIFEST.partial`). Raise `--max-attempts` or adjust the filter and rerun.
 Per-download diagnostics are stored in `clips/.../download.log`.
 
+On Windows with FFmpeg 8.1, section downloads could spend the entire 600-second
+budget draining an audio response before seeking to the requested timestamp.
+The downloader now sets `-short_seek_size 1` on every FFmpeg input so it seeks
+instead of reading through megabytes of unwanted media. It also applies a
+30-second network timeout per input and stops the entire downloader process
+tree when the per-clip timeout expires, avoiding leftover FFmpeg processes and
+locked temporary files. Raising `--download-timeout` is not a fix for this issue.
+
+The frame grouper also writes images using Python's Unicode-aware file handling,
+fixing `Failed to write frame` for token directories such as `000000_ĠThis`.
+Restart after updating these files; completed video downloads remain cached
+and affected alignments are rebuilt automatically. Regression checks:
+
+```powershell
+python -m unittest discover -s tests -p test_download_recovery.py -v
+```
+
 When yt-dlp reports an unavailable or removed upload, the remaining metadata
 clips from that upload are skipped for the current run without consuming more
 attempts; valid cached clips can still be reused. Download errors include
