@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare one TalkVid dataset, train all five variants, then evaluate the same samples.
+"""Prepare one TalkVid dataset, then train and evaluate each variant on the same samples.
 
 Use -N to download TalkVid, or --manifest to reuse a prepared dataset. Training
 options apply to all compatible variants; --variant-args provides per-variant
@@ -9,6 +9,7 @@ overrides. Each stage runs in its own process to release model/GPU memory.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -71,9 +72,9 @@ def build_argparser():
     parser.add_argument("--variant-args", action="append", default=[], metavar="N:FLAGS",
                         help="Per-variant overrides, e.g. '4:--lr 1e-4 --batch-size 4'; repeatable")
     parser.add_argument("--eval-batch-size", type=train_talkvid.positive_int, default=None,
-                        help="Batch size for final evaluation (default: shared --batch-size or 2)")
+                        help="Batch size for each evaluation (default: shared --batch-size or 2)")
     parser.add_argument("--eval-device", default=None,
-                        help="Device for final evaluation (default: shared --device or auto)")
+                        help="Device for each evaluation (default: shared --device or auto)")
     shared = parser.add_argument_group("Shared training options (individual script defaults otherwise)")
     download = parser.add_argument_group("TalkVid download and alignment options")
     cookies = download.add_mutually_exclusive_group()
@@ -103,7 +104,7 @@ def option_tokens(action, value):
 def variant_overrides(parser, specifications):
     actions = training_actions()
     # Tokenization is shared with the downloader; metric semantics are shared
-    # with the final evaluator. Neither should diverge in one child process.
+    # with the evaluator. Neither should diverge in one child process.
     protected = MANAGED | {"pretrained_lm", "metrics_include_eos"}
     option_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     for dest, action in actions.items():
@@ -171,24 +172,40 @@ def build_commands(parser, args, run_dir):
                   and (dest not in SPECIFIC or index in SPECIFIC[dest])}
         values.update(overrides[index])
         flags = [token for dest, value in values.items() for token in option_tokens(actions[dest], value)]
-        # Evaluate all saved checkpoints only after every model finishes training.
+        # Evaluate the saved checkpoint in a separate process immediately after training.
         flags += [f"--manifest={snapshot}", f"--output={checkpoint}", "--metrics-csv=",
                   f"--variant-name={module.DEFAULTS['variant_name']}"]
         parsed = module.build_argparser().parse_args(flags)
         validate_training_args(parser, parsed)
         stages.append({"name": f"train_{index}", "command": [sys.executable, module.__file__, *flags]})
-    command = [sys.executable, str(ROOT / "tests" / "evaluate_checkpoints.py"),
-               "--manifest", str(snapshot), "--checkpoints", *map(str, checkpoints),
-               "--output", str(run_dir / "all_variants.csv"),
-               "--batch-size", str(args.eval_batch_size or getattr(args, "batch_size", 2)),
-               "--device", args.eval_device or getattr(args, "device", "auto"),
-               "--workers", str(getattr(args, "workers", 0))]
-    if getattr(args, "metrics_include_eos", False):
-        command.append("--include-eos")
-    # Each checkpoint supplies its own preprocessing and max_frames, including
-    # per-variant overrides. The same sample manifest is always used.
-    stages.append({"name": "evaluate", "command": command})
+        metrics_csv = checkpoint.with_suffix(".metrics.csv")
+        command = [sys.executable, str(ROOT / "tests" / "evaluate_checkpoints.py"),
+                   "--manifest", str(snapshot), "--checkpoints", str(checkpoint),
+                   "--output", str(metrics_csv),
+                   "--batch-size", str(args.eval_batch_size or getattr(args, "batch_size", 2)),
+                   "--device", args.eval_device or getattr(args, "device", "auto"),
+                   "--workers", str(getattr(args, "workers", 0))]
+        if getattr(args, "metrics_include_eos", False):
+            command.append("--include-eos")
+        # Each checkpoint supplies its own preprocessing and max_frames, including
+        # per-variant overrides. The same sample manifest is always used.
+        stages.append({"name": f"evaluate_{index}", "command": command, "csv": str(metrics_csv)})
     return prepared, snapshot, checkpoints, stages
+
+
+def combine_metrics_csv(paths, output):
+    """Publish completed variants together without risking the previous combined CSV."""
+    rows = []
+    for path in paths:
+        with Path(path).open(newline="", encoding="utf-8") as stream:
+            rows.extend(csv.DictReader(stream))
+    output = Path(output)
+    temporary = output.with_suffix(".csv.tmp")
+    try:
+        train.write_metrics_csv(temporary, rows)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def snapshot_samples(source, destination, expected_count=None):
@@ -251,6 +268,7 @@ def main(argv=None):
     train_talkvid.write_json(report_path, report)
     print(f"Run directory: {run_dir}", flush=True)
     try:
+        completed_csvs = []
         if args.manifest:
             report["samples"] = snapshot_samples(prepared, snapshot)
         for stage in report["stages"]:
@@ -263,6 +281,10 @@ def main(argv=None):
             run_stage(stage["command"], Path(stage["log"]))
             if stage["name"] == "download":
                 report["samples"] = snapshot_samples(prepared, snapshot, args.num_videos)
+            if "csv" in stage:
+                combine_metrics_csv([*completed_csvs, stage["csv"]], report["csv"])
+                completed_csvs.append(stage["csv"])
+                print(f"Updated combined CSV: {report['csv']} ({len(completed_csvs)}/5 variants)", flush=True)
             stage["status"] = "complete"
             train_talkvid.write_json(report_path, report)
         verify_snapshot(report["samples"])

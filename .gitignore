@@ -13,3 +13,4 @@
 !tests/
 !tests/train_*
 !tests/test_download_recovery.py
+!tests/test_run_all_variants.py

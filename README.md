@@ -25,8 +25,10 @@ python3 run_all_variants.py -N 20 --dataset-language English \
 ```
 
 FFmpeg (`ffmpeg` and `ffprobe`) and a supported yt-dlp JavaScript runtime must be
-available as described below. The combined result is
-`runs/talkvid_comparison/all_variants.csv`. See the [all-in-one runner instructions](tests/README.md#all-in-one-download-train-and-evaluate)
+available as described below. Each variant is evaluated as soon as its training
+finishes, saving a CSV beside its checkpoint and updating
+`runs/talkvid_comparison/all_variants.csv` before the next variant starts.
+See the [all-in-one runner instructions](tests/README.md#all-in-one-download-train-and-evaluate)
 for per-variant overrides and reusing an existing manifest.
 
 ## Download TalkVid and train

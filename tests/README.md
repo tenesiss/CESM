@@ -73,8 +73,8 @@ manifest and output paths resolve from the current working directory.
 ## All-in-one download, train and evaluate
 
 From the repository root, run `run_all_variants.py` to download and align TalkVid
-**once**, train variants 1–5 sequentially, then load all five saved checkpoints
-and evaluate them on **the exact same manifest samples**:
+**once**, then train and evaluate variants 1–5 sequentially on **the exact same
+manifest samples**. Each variant's CSV is saved before the next variant starts:
 
 ```bash
 python3 -m pip install -r requirements-talkvid.txt
@@ -120,20 +120,25 @@ RUN_DIR/
   checkpoints/test_3_no_ht0.pt
   checkpoints/test_4_weighted_ht0.pt
   checkpoints/test_5_frame_tokens.pt
-  all_variants.csv                 # Five rows per sample, one for each variant
+  checkpoints/test_1_as_is.metrics.csv  # One CSV beside each completed checkpoint
+  ...
+  all_variants.csv                 # Updated after each variant; five rows per sample when complete
   run.json                        # Manifest SHA-256, stage status, commands and output paths
   logs/download.log               # TalkVid mode only
   logs/train_1.log ... train_5.log
-  logs/evaluate.log
+  logs/evaluate_1.log ... evaluate_5.log
 ```
 
 `samples.jsonl` is copied once from the completed preparation (or input manifest),
-with absolute video paths. Every training command and the final evaluator use
+with absolute video paths. Every training and evaluation command uses
 that snapshot, and its SHA-256 is checked between stages. The video files remain
 in their original/download locations. Keep those files for later evaluation.
 Training processes exit before the next stage starts, releasing Whisper and
-model memory between stages. The runner disables the individual scripts'
-automatic CSV passes and evaluates once, after all five checkpoints are saved.
+model memory between stages. After each variant finishes training, the runner
+evaluates its saved checkpoint in a separate process and writes its
+`CHECKPOINT_STEM.metrics.csv`. It then atomically updates `all_variants.csv`
+with every completed variant's results before starting the next training stage.
+The individual scripts' automatic CSV passes are disabled to avoid duplicate evaluation.
 
 Unspecified settings retain each variant script's `DEFAULTS`. Shared flags such
 as `--lr`, `--batch-size`, `--epochs`, `--pretrained-lm`, `--amp`, and `--seed`
@@ -164,14 +169,15 @@ Evaluation uses each checkpoint's own preprocessing and section size, so
 per-variant `--no-face-detector` or `--max-frames` settings are preserved.
 Use `--eval-batch-size` or `--eval-device` to change evaluation resources;
 otherwise evaluation uses the shared batch size/device (or `2`/`auto`).
-`--metrics-include-eos` applies consistently to the final token metrics.
+`--metrics-include-eos` applies consistently to each variant's token metrics.
 
 The combined CSV has the per-sample NLL and probability-margin columns described
 below: token averages for variants 1–4, labeled-frame averages for variant 5.
 These are measurements on the downloaded **training samples**. For N samples,
-the CSV contains 5 × N data rows, even when videos are split into sections.
-If a stage fails, later stages do not run; completed checkpoints, logs and the
-stage status remain available. Once all checkpoints exist, the standalone
+the completed CSV contains 5 × N data rows, even when videos are split into sections.
+During the run, it contains N rows per successfully evaluated variant.
+If a stage fails, later stages do not run; completed checkpoints, per-variant CSVs,
+the combined CSV, logs and stage status remain available. Once all checkpoints exist, the standalone
 evaluator below can repeat evaluation using `RUN_DIR/samples.jsonl`.
 
 ## Per-sample CSV after training
