@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Prepare one TalkVid dataset, then train and evaluate each variant on the same samples.
+"""Prepare one video dataset, then train and evaluate each variant on the same samples.
 
-Use -N to download TalkVid, or --manifest to reuse a prepared dataset. Training
+Use -N with --dataset talkvid/hdtf, or --manifest to reuse a prepared dataset. Training
 options apply to all compatible variants; --variant-args provides per-variant
 overrides. Each stage runs in its own process to release model/GPU memory.
 """
@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 import train
-import train_talkvid
+import train_downvid
 from tests import (
     train_1_as_is, train_2_tcross_loss, train_3_no_ht0,
     train_4_weighted_ht0, train_5_frame_tokens,
@@ -63,23 +63,23 @@ def copy_option(parser, action, *, default=argparse.SUPPRESS):
 def build_argparser():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--num-videos", "-N", type=train_talkvid.positive_int,
-                        help="Download and align exactly N usable TalkVid clips once")
+    source.add_argument("--num-videos", "-N", type=train_downvid.positive_int,
+                        help="Download and align exactly N usable videos/clips once")
     source.add_argument("--manifest", type=Path,
                         help="Reuse these exact samples instead of downloading")
     parser.add_argument("--run-dir", type=Path,
                         help="New output directory (default: runs/variants_TIMESTAMP beside this script)")
     parser.add_argument("--variant-args", action="append", default=[], metavar="N:FLAGS",
                         help="Per-variant overrides, e.g. '4:--lr 1e-4 --batch-size 4'; repeatable")
-    parser.add_argument("--eval-batch-size", type=train_talkvid.positive_int, default=None,
+    parser.add_argument("--eval-batch-size", type=train_downvid.positive_int, default=None,
                         help="Batch size for each evaluation (default: shared --batch-size or 2)")
     parser.add_argument("--eval-device", default=None,
                         help="Device for each evaluation (default: shared --device or auto)")
     shared = parser.add_argument_group("Shared training options (individual script defaults otherwise)")
-    download = parser.add_argument_group("TalkVid download and alignment options")
+    download = parser.add_argument_group("Dataset download and alignment options")
     cookies = download.add_mutually_exclusive_group()
     training = training_actions()
-    for action in train_talkvid.build_argparser()._actions:
+    for action in train_downvid.build_argparser()._actions:
         if action.dest in MANAGED | DOWNLOAD_ONLY:
             continue
         if action.dest in training:
@@ -153,11 +153,11 @@ def build_commands(parser, args, run_dir):
     overrides = variant_overrides(parser, args.variant_args)
     snapshot = run_dir / "samples.jsonl"
     stages = []
-    prepared = args.manifest.expanduser().resolve() if args.manifest else run_dir / "talkvid.jsonl"
+    prepared = args.manifest.expanduser().resolve() if args.manifest else run_dir / f"{args.dataset}.jsonl"
     if args.num_videos is not None:
-        command = [sys.executable, str(ROOT / "train_talkvid.py"), "--prepare-only",
+        command = [sys.executable, str(ROOT / "train_downvid.py"), "--prepare-only",
                    f"--num-videos={args.num_videos}", f"--manifest={prepared}"]
-        for action in train_talkvid.build_argparser()._actions:
+        for action in train_downvid.build_argparser()._actions:
             if action.dest in MANAGED | DOWNLOAD_ONLY:
                 continue
             if action.dest not in actions or action.dest in ("pretrained_lm", "pretrained_lm_local_files_only"):
@@ -265,7 +265,7 @@ def main(argv=None):
     report = {"status": "running", "source": str(prepared), "samples": None,
               "checkpoints": list(map(str, checkpoints)), "csv": str(run_dir / "all_variants.csv"),
               "stages": [dict(stage, status="pending") for stage in stages]}
-    train_talkvid.write_json(report_path, report)
+    train_downvid.write_json(report_path, report)
     print(f"Run directory: {run_dir}", flush=True)
     try:
         completed_csvs = []
@@ -276,7 +276,7 @@ def main(argv=None):
                 verify_snapshot(report["samples"])
             stage["status"] = "running"
             stage["log"] = str(run_dir / "logs" / f"{stage['name']}.log")
-            train_talkvid.write_json(report_path, report)
+            train_downvid.write_json(report_path, report)
             print(f"\n{stage['name']}: {shlex.join(stage['command'])}", flush=True)
             run_stage(stage["command"], Path(stage["log"]))
             if stage["name"] == "download":
@@ -286,17 +286,17 @@ def main(argv=None):
                 completed_csvs.append(stage["csv"])
                 print(f"Updated combined CSV: {report['csv']} ({len(completed_csvs)}/5 variants)", flush=True)
             stage["status"] = "complete"
-            train_talkvid.write_json(report_path, report)
+            train_downvid.write_json(report_path, report)
         verify_snapshot(report["samples"])
         report["status"] = "complete"
-        train_talkvid.write_json(report_path, report)
+        train_downvid.write_json(report_path, report)
     except BaseException as exc:
         report["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
         for stage in report["stages"]:
             if stage["status"] == "running":
                 stage["status"] = report["status"]
         report["error"] = str(exc)
-        train_talkvid.write_json(report_path, report)
+        train_downvid.write_json(report_path, report)
         raise
     print(f"\nCompleted all five variants on {report['samples']['count']} samples.", flush=True)
     print(f"Combined CSV: {report['csv']}", flush=True)

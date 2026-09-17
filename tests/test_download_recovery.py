@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 import train
-import train_talkvid as pipeline
+import train_downvid as pipeline
 
 
 class PipelineFixture(unittest.TestCase):

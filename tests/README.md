@@ -72,12 +72,12 @@ manifest and output paths resolve from the current working directory.
 
 ## All-in-one download, train and evaluate
 
-From the repository root, run `run_all_variants.py` to download and align TalkVid
+From the repository root, run `run_all_variants.py` to download and align TalkVid or HDTF
 **once**, then train and evaluate variants 1–5 sequentially on **the exact same
 manifest samples**. Each variant's CSV is saved before the next variant starts:
 
 ```bash
-python3 -m pip install -r requirements-talkvid.txt
+python3 -m pip install -r requirements-downvid.txt
 python3 run_all_variants.py \
   -N 20 --dataset-language English \
   --work-dir data/talkvid --run-dir runs/talkvid_comparison \
@@ -86,12 +86,25 @@ python3 run_all_variants.py \
   --tcross-margin 1.0 --lambda-tcross 1.0 --w-t 0.5
 ```
 
-Install FFmpeg (`ffmpeg` and `ffprobe`) and a supported yt-dlp JavaScript runtime
-as described in the repository README. All TalkVid download/alignment options
+For HDTF, add `--dataset hdtf` and use `--work-dir data/hdtf`. For example:
+
+```bash
+python3 run_all_variants.py --dataset hdtf -N 100 \
+  --download-max-frames 256 --max-frames 128 --language en \
+  --run-dir runs/hdtf_comparison --epochs 50 --batch-size 2
+```
+
+HDTF also accepts `--hdtf-archive PATH_OR_URL` for a local or alternate ZIP.
+The download stage calls `train_downvid.py` once and shares the resulting exact
+sample manifest with all variants. HDTF transfers each selected compressed ZIP
+member, then applies the frame cap locally and trims audio before alignment.
+
+Install FFmpeg (`ffmpeg` and `ffprobe`); only TalkVid requires a supported
+yt-dlp JavaScript runtime, as described in the repository README. All TalkVid download/alignment options
 are available, including repeated `--dataset-language`, `--metadata`,
 `--whisper-model`, `--whisper-device`, `--language`, `--cookies`,
 `--cookies-from-browser`, `--js-runtimes`, and `--download-max-frames`.
-The original TalkVid downloader reuses its existing clip/alignment cache and
+The downloader reuses its existing clip/alignment cache and
 replaces unusable candidates until it has N usable samples. An incomplete or
 failed preparation stops the runner before any variant is trained.
 
@@ -103,8 +116,8 @@ python3 run_all_variants.py \
   --epochs 10 --batch-size 2 --max-frames 128 --w-t 0.5
 ```
 
-Choose either `-N` or `--manifest`. `--work-dir` controls the reusable TalkVid
-cache; `--run-dir` holds this experiment's outputs and must be empty or new.
+Choose either `-N` or `--manifest`. `--work-dir` controls the reusable dataset
+cache (default: `data/talkvid` or `data/hdtf`); `--run-dir` holds this experiment's outputs and must be empty or new.
 If omitted, a new timestamped directory under `runs/` is used. Paths passed on
 the CLI resolve from the current directory, so invoking the runner by its
 absolute path from elsewhere also works.
@@ -114,7 +127,7 @@ The runner creates:
 ```text
 RUN_DIR/
   samples.jsonl                    # Fixed sample order, labels and absolute video paths
-  talkvid.jsonl                    # Downloader output (TalkVid mode only)
+  <dataset>.jsonl                  # talkvid.jsonl or hdtf.jsonl in download mode
   checkpoints/test_1_as_is.pt
   checkpoints/test_2_tcross_loss.pt
   checkpoints/test_3_no_ht0.pt
@@ -124,7 +137,7 @@ RUN_DIR/
   ...
   all_variants.csv                 # Updated after each variant; five rows per sample when complete
   run.json                        # Manifest SHA-256, stage status, commands and output paths
-  logs/download.log               # TalkVid mode only
+  logs/download.log               # Download mode only
   logs/train_1.log ... train_5.log
   logs/evaluate_1.log ... evaluate_5.log
 ```

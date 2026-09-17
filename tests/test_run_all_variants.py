@@ -18,7 +18,7 @@ import torch
 
 import run_all_variants as runner
 import train
-import train_talkvid
+import train_downvid
 
 
 class AllVariantRunnerTests(unittest.TestCase):
@@ -37,7 +37,7 @@ class AllVariantRunnerTests(unittest.TestCase):
         self.assertEqual([s["name"] for s in stages], ["download", *[
             name for index in range(1, 6) for name in (f"train_{index}", f"evaluate_{index}")
         ]])
-        preparation = train_talkvid.build_argparser().parse_args(stages[0]["command"][2:])
+        preparation = train_downvid.build_argparser().parse_args(stages[0]["command"][2:])
         self.assertTrue(preparation.prepare_only)
         self.assertEqual(preparation.num_videos, 3)
         self.assertEqual(len(set(checkpoints)), 5)
@@ -72,7 +72,7 @@ class AllVariantRunnerTests(unittest.TestCase):
             "--download-max-frames", "27", "--cookies", str(self.root / "cookies file.txt"),
             "--eval-batch-size", "1", "--eval-device", "cpu",
         ])
-        prepare = train_talkvid.build_argparser().parse_args(stages[0]["command"][2:])
+        prepare = train_downvid.build_argparser().parse_args(stages[0]["command"][2:])
         self.assertEqual(prepare.dataset_language, ["English", "Spanish"])
         self.assertEqual(prepare.download_max_frames, 27)
         self.assertEqual(prepare.pretrained_lm, "a/model with spaces")
@@ -94,6 +94,25 @@ class AllVariantRunnerTests(unittest.TestCase):
             self.assertIn("--include-eos", command)
             self.assertEqual(command[command.index("--batch-size") + 1], "1")
             self.assertEqual(command[command.index("--device") + 1], "cpu")
+
+    def test_hdtf_selection_and_frame_cap_route_only_to_downloader(self):
+        prepared, _, _, stages = self.plan([
+            "--dataset", "hdtf", "-N", "10", "--hdtf-archive", "archive with spaces.zip",
+            "--start-index", "7", "--download-max-frames", "50", "--max-frames", "25",
+            "--download-retries", "2", "--download-timeout", "90",
+        ])
+        self.assertEqual(prepared.name, "hdtf.jsonl")
+        self.assertEqual(Path(stages[0]["command"][1]).name, "train_downvid.py")
+        args = train_downvid.build_argparser().parse_args(stages[0]["command"][2:])
+        self.assertEqual((args.dataset, args.num_videos, args.start_index), ("hdtf", 10, 7))
+        self.assertEqual(args.hdtf_archive, "archive with spaces.zip")
+        self.assertEqual(args.download_max_frames, 50)
+        self.assertEqual((args.download_retries, args.download_timeout), (2, 90))
+        self.assertIsNone(args.work_dir)  # Downloader chooses data/hdtf.
+        for module, stage in zip(runner.VARIANTS, stages[1::2]):
+            training = module.build_argparser().parse_args(stage["command"][2:])
+            self.assertEqual(training.max_frames, 25)
+            self.assertNotIn("--dataset=hdtf", stage["command"])
 
     def test_invalid_or_dataset_changing_overrides_fail_before_download(self):
         for flags in (
@@ -136,7 +155,7 @@ class AllVariantRunnerTests(unittest.TestCase):
                 calls.append(command)
                 if mode == "failure":
                     raise subprocess.CalledProcessError(1, command)
-                args = train_talkvid.build_argparser().parse_args(command[2:])
+                args = train_downvid.build_argparser().parse_args(command[2:])
                 Path(args.manifest).write_text(json.dumps({"video": "unused", "text": "a", "windows": [[0, 1]]}) + "\n")
 
             with contextlib.redirect_stdout(io.StringIO()), patch.object(runner, "run_stage", side_effect=download):
@@ -236,9 +255,9 @@ class AllVariantRunnerTests(unittest.TestCase):
         completed_metrics = []
 
         def stage(command, log):
-            if Path(command[1]).name == "train_talkvid.py":
+            if Path(command[1]).name == "train_downvid.py":
                 downloads.append(command)
-                args = train_talkvid.build_argparser().parse_args(command[2:])
+                args = train_downvid.build_argparser().parse_args(command[2:])
                 Path(args.manifest).write_text("".join(json.dumps(row) + "\n" for row in rows))
                 log.write_text("Offline fixture replaces network download/alignment.\n")
             else:

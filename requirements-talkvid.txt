@@ -1,4 +1,2 @@
--r requirements.txt
-faster-whisper>=1.1
-yt-dlp[default]>=2026.8.19
-ijson>=3.3
+# Compatibility with existing setup commands.
+-r requirements-downvid.txt
