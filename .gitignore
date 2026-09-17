@@ -5,6 +5,7 @@
 !requirements.txt
 !requirements-talkvid.txt
 !train.py
+!train_mathematics.tex
 !infer.py
 !run_all_variants.py
 !grouper.py

@@ -1,0 +1,706 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=27mm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\ind}{\mathbf{1}}
+\newcommand{\LN}{\operatorname{LN}}
+\newcommand{\GN}{\operatorname{GN}}
+\newcommand{\MHA}{\operatorname{MHA}}
+\newcommand{\FFN}{\operatorname{FFN}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\silu}{\operatorname{SiLU}}
+\newcommand{\KL}{\operatorname{KL}}
+\newcommand{\JS}{\operatorname{JS}}
+\newcommand{\sg}{\operatorname{stopgrad}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\BOS}{\mathrm{BOS}}
+\newcommand{\EOS}{\mathrm{EOS}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\norm}[1]{\left\lVert #1\right\rVert}
+\newcommand{\pos}[1]{\left[#1\right]_{+}}
+\DeclareMathOperator{\concat}{concat}
+\DeclareMathOperator{\Pool}{Pool}
+\DeclareMathOperator{\Conv}{Conv}
+
+\numberwithin{equation}{section}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45em}
+\setlength{\emergencystretch}{2em}
+\allowdisplaybreaks[1]
+
+\title{Causal Video-to-Text Learning\\
+\large Mathematical Formulation and Training Procedure}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2em}
+
+\begin{abstract}
+This document formulates the causal video-to-text model and two-stage
+learning procedure defined in \texttt{train.py}. It describes aligned
+supervision, causal visual and textual representations, multimodal
+prediction, projection and attention regularization, and confidence targets
+derived from a frozen predictor. The presentation is restricted to
+mathematics and algorithmic operations.
+\end{abstract}
+
+\section{Sequences, alignments, and causal information}
+\label{sec:alignment}
+
+For one example, let $I_0,\ldots,I_{F-1}$ be video frames and
+$y_1,\ldots,y_N$ the transcript tokens in a vocabulary $\mathcal V$ of
+size $V>1$. Frame indices start at zero. Token $i$ has an inclusive
+alignment window
+\begin{equation}
+\mathcal W_i=[a_i,e_i]\cap\mathbb Z,
+\qquad 0\leq a_i\leq e_i<F,
+\qquad e_i<a_{i+1}.
+\end{equation}
+Gaps between windows are permitted. Padding positions are excluded from
+supervision and from attention keys.
+
+The teacher sequence is $(\BOS,y_1,\ldots,y_N)$. Its causal text states are
+\begin{equation}
+z_0=E_t(\BOS),\qquad
+z_j=E_t(\BOS,y_1,\ldots,y_j)_j,\quad 1\leq j\leq N.
+\end{equation}
+Thus the query for target $y_i$ is $q_i=z_{i-1}$: the target itself is
+absent from its query. Token-query prediction also uses
+$y_{N+1}=\EOS$, $q_{N+1}=z_N$, and the singleton window
+$\mathcal W_{N+1}=\{F-1\}$. This additional target belongs only to the
+true end of a video. Frame prediction and confidence supervision use
+real-token windows only.
+
+There are two distinct cross-attention masks. A token query may attend
+to video up to the end of its own window:
+\begin{equation}
+M^{t\to v}_{if}=\ind\{0\leq f\leq e_i\}.
+\label{eq:t2v}
+\end{equation}
+This mask allows all earlier frames, including frames before $a_i$.
+Window-local attention is encouraged separately by a loss.
+
+The video-to-text mask uses the time at which each text state becomes
+available:
+\begin{equation}
+\alpha_0=0,\qquad \alpha_j=e_j+1\quad(j\geq1),
+\qquad
+M^{v\to t}_{fj}=\ind\{\alpha_j\leq f\}.
+\label{eq:v2t}
+\end{equation}
+In particular, a token finishing at frame $e_j$ can influence this
+branch only from frame $e_j+1$. Both masks are intersected with the
+valid query and key positions for each example. Self-attention in
+either encoder uses $M^{\mathrm{causal}}_{rs}=\ind\{s\leq r\}$, with
+invalid keys removed.
+
+\subsection{Alignment under tokenization}
+
+If alignments are supplied for source characters, a token covering the
+half-open character span $[c_i,d_i)$ receives the window
+\begin{equation}
+[a_i,e_i]=[a^{\mathrm{char}}_{c_i},
+            e^{\mathrm{char}}_{d_i-1}].
+\end{equation}
+If $k$ consecutive tokens share exactly the same character span, its
+$L$ frames are partitioned into $k$ consecutive nonempty intervals.
+For part $r=0,\ldots,k-1$, the interval length is
+\begin{equation}
+L_r=\left\lfloor\frac{L}{k}\right\rfloor
+       +\ind\{r<L\bmod k\},\qquad L\geq k.
+\end{equation}
+Token-aligned windows can instead be supplied directly. The resulting
+token windows must remain ordered and non-overlapping.
+
+\section{Causal representation learning}
+
+All learned affine maps below have independent parameters unless sharing
+is explicitly stated. Layer normalization $\LN$ acts on the feature
+coordinates of one position. Group normalization $\GN$ in the visual
+front end acts within a single frame, across spatial positions and
+channel groups, and never aggregates across time.
+
+Let $\sigma(x)=(1+e^{-x})^{-1}$ and $\silu(x)=x\sigma(x)$.
+Write $\mathcal D_p$ for inverted dropout: during training,
+$\mathcal D_p(x)=m\odot x/(1-p)$ with independent
+$m_k\sim\operatorname{Bernoulli}(1-p)$; during deterministic
+prediction it is the identity. Each occurrence draws its own mask.
+
+\subsection{Masked multi-head attention}
+
+For query vectors $u_r$ and key/value vectors $v_s$, head $h$ forms
+\begin{equation}
+Q_r^{h}=W_Q^{h}u_r+b_Q^{h},\qquad
+K_s^{h}=W_K^{h}v_s+b_K^{h},\qquad
+V_s^{h}=W_V^{h}v_s+b_V^{h}.
+\end{equation}
+For head width $d_h$, the pre-dropout probabilities are
+\begin{equation}
+A^{h}_{rs}=
+\begin{cases}
+\displaystyle
+\frac{\exp(\langle Q_r^{h},K_s^{h}\rangle/\sqrt{d_h})}
+ {\sum_{u:M_{ru}=1}\exp(\langle Q_r^{h},K_u^{h}\rangle/\sqrt{d_h})},
+ & M_{rs}=1,\\[1.2em]
+0, & M_{rs}=0.
+\end{cases}
+\label{eq:attention}
+\end{equation}
+A row with no admissible keys has all its probabilities set to zero.
+With $H$ heads,
+\begin{equation}
+\MHA(U,V;M)_r
+=W_O\concat_{h=1}^{H}\left(
+ \sum_s\mathcal D_p(A^h)_{rs}V_s^h\right)+b_O.
+\end{equation}
+The attention regularizers below use $A^h$ before dropout.
+
+The positionwise feed-forward transformation is
+\begin{equation}
+\FFN(x)=\mathcal D_p\!\left[
+ W_2\mathcal D_p\!\left(\silu(W_1\LN(x)+b_1)\right)+b_2
+\right].
+\label{eq:ffn}
+\end{equation}
+
+\subsection{Visual front end}
+
+A mouth crop $\mathcal C_{I_0}$ is fixed using the first video frame.
+After resizing, the RGB intensities are normalized as
+\begin{equation}
+x_f=\frac{\mathcal C_{I_0}(I_f)}{127.5}-1.
+\end{equation}
+The same crop is retained throughout the video, so its selection does
+not depend on future frames.
+
+The first visual transformation is a causal spatiotemporal convolution:
+\begin{equation}
+u_f=\silu\!\left(\GN\!\left[
+   \sum_{r=0}^{4}K_r*_{\mathrm{sp}}x_{f-r}
+\right]\right),\qquad x_f=0\text{ for }f<0.
+\end{equation}
+Here $*_{\mathrm{sp}}$ is a spatial convolution. The spatial kernel is
+$5\times5$ with stride two and centered padding; time is not
+subsampled and padding is entirely in the past.
+
+Each frame then passes through three spatial residual blocks. A block is
+\begin{equation}
+\mathcal R(u)=\silu\!\left(
+ \GN_2\!\left[\Conv_2\bigl(\silu(\GN_1(\Conv_1(u)))\bigr)\right]
+ +\mathcal S(u)\right),
+\end{equation}
+where the main convolutions have $3\times3$ kernels and $\mathcal S$
+is the matching identity or $1\times1$ projection. The three blocks
+have output widths $64$, $96$, and $128$, with spatial downsampling by
+two in each block. Spatial averaging and an affine projection give
+\begin{equation}
+r_f=W_r\Pool\bigl(\mathcal R_3(\mathcal R_2(\mathcal R_1(u_f)))\bigr)+b_r
+\in\R^{d_v}.
+\end{equation}
+
+\subsection{Positions and temporal visual layers}
+
+For feature width $d$, let $h_d=\lceil d/2\rceil$ and
+\begin{equation}
+\omega_k=10000^{-k/\max(1,h_d-1)},\qquad
+\mathrm{PE}_d(f)_{2k}=\sin(f\omega_k),\qquad
+\mathrm{PE}_d(f)_{2k+1}=\cos(f\omega_k),
+\label{eq:positions}
+\end{equation}
+retaining only coordinates smaller than $d$. The visual sequence begins
+at $X^{(0)}_f=r_f+\mathrm{PE}_{d_v}(f)$.
+
+One temporal visual layer applies
+\begin{align}
+U&=X+\tfrac12\FFN(X),\\
+R&=U+\mathcal D_p\!\left[
+ \MHA(\LN(U),\LN(U);M^{\mathrm{causal}})\right],\\
+X^{+}&=R+\mathcal K(R).
+\label{eq:visual-layer}
+\end{align}
+The causal convolutional transformation $\mathcal K$ is defined by
+\begin{align}
+[A_f,B_f]&=W_{\mathrm{in}}\LN(R_f)+b_{\mathrm{in}},\\
+G_f&=A_f\odot\sigma(B_f),\\
+\mathcal K(R)_f
+ &=\mathcal D_p\!\left[
+ W_{\mathrm{out}}\silu\!\left(
+ b_{\mathrm{dw}}+\sum_{r=0}^{k_c-1}d_r\odot G_{f-r}\right)
+ +b_{\mathrm{out}}\right].
+\end{align}
+The vectors $d_r$ specify a depthwise temporal convolution and
+$G_f=0$ for negative indices. After $L_v$ such layers,
+\begin{equation}
+v_f=\LN(X_f^{(L_v)})\in\R^{d_v}.
+\end{equation}
+There is one half-weighted feed-forward residual in each visual layer,
+followed by attention and convolution. Every $v_f$ depends only on
+$x_0,\ldots,x_f$.
+
+\subsection{Textual representations}
+
+For a learned text encoder, set $t_0=\BOS$ and $t_j=y_j$ for $j\geq1$,
+and initialize
+\begin{equation}
+Z_j^{(0)}=\operatorname{Embed}(t_j)+\mathrm{PE}_{d_t}(j).
+\end{equation}
+Each text layer is
+\begin{align}
+U&=Z+\mathcal D_p\!\left[
+ \MHA(\LN(Z),\LN(Z);M^{\mathrm{causal}})\right],\\
+Z^{+}&=U+\FFN(U).
+\end{align}
+After $L_t$ layers, $z_j=\LN(Z_j^{(L_t)})\in\R^{d_t}$.
+
+Alternatively, $z_j$ is the final hidden state of a pretrained causal
+language model on $(\BOS,y_1,\ldots,y_j)$. This alternative retains
+that model's own internal architecture and positional representation;
+its vocabulary prediction head is not used. Its parameters may be
+fixed or optimized during the first training stage. A fixed text
+encoder is evaluated deterministically.
+
+\section{Multimodal prediction}
+
+The two modalities are mapped to a common width $d$ by bias-free
+projections:
+\begin{equation}
+\bar v_f=P_vv_f,\qquad \bar z_j=P_tz_j,
+\qquad \bar q_i=\bar z_{i-1}.
+\label{eq:projections}
+\end{equation}
+
+\subsection{Token-query variants}
+
+Text queries read the visual prefix through
+\begin{equation}
+c_i=\MHA(\bar Q,\bar V;M^{t\to v})_i.
+\end{equation}
+Let $\rho$ select the residual contribution of the text query:
+\begin{equation}
+\rho=
+\begin{cases}
+1,&\text{residual fusion},\\
+0,&\text{cross-only fusion},\\
+w_t,&\text{weighted fusion}.
+\end{cases}
+\end{equation}
+The scalar $w_t$ is fixed, finite, and not learned. The shared
+token-prediction transformation is
+\begin{align}
+h_i&=\LN_t(\rho\bar q_i+c_i),\\
+\widehat h_i&=\LN_{t,\mathrm{out}}(h_i+\FFN_t(h_i)),\\
+\ell_i&=W_y\widehat h_i+b_y,\qquad
+p_i=\softmax(\ell_i).
+\label{eq:token-head}
+\end{align}
+Consequently, the supervised token distribution conditions on the
+transcript prefix and visual evidence through the aligned endpoint:
+\begin{equation}
+p_i(y)=p_\theta(y\mid y_{<i},x_{0:e_i}).
+\end{equation}
+
+\subsection{Frame prediction variant}
+
+The frame variant has no text-to-video attention. Instead, each frame
+queries the text states already available at that frame:
+\begin{equation}
+d_f=\MHA(\bar V,\bar Z;M^{v\to t})_f.
+\label{eq:video-cross}
+\end{equation}
+It uses the token head on a visual residual:
+\begin{align}
+h_f^{\mathrm{fr}}&=\LN_t(\bar v_f+d_f),\\
+\widehat h_f^{\mathrm{fr}}
+ &=\LN_{t,\mathrm{out}}\bigl(h_f^{\mathrm{fr}}+\FFN_t(h_f^{\mathrm{fr}})\bigr),\\
+\ell_f^{\mathrm{fr}}&=W_y\widehat h_f^{\mathrm{fr}}+b_y,
+\qquad p_f^{\mathrm{fr}}=\softmax(\ell_f^{\mathrm{fr}}).
+\end{align}
+For $f\in\mathcal W_i$, the supervised frame label is $y_i$.
+Frames in gaps have no supervised label. No frame is assigned an
+$\EOS$ target.
+
+\subsection{Confidence branch}
+
+All variants produce a scalar confidence logit at each frame. With
+$d_f$ defined by \eqref{eq:video-cross}, this branch applies
+\begin{align}
+g_f&=\LN_v(\bar v_f+d_f),\\
+s_f^{v}&=\MHA(\LN_{v,a}(G),\LN_{v,a}(G);M^{\mathrm{causal}})_f,\\
+g'_f&=\LN_{v,\mathrm{self}}(g_f+s_f^{v}),\\
+\widehat g_f&=\LN_{v,\mathrm{out}}(g'_f+\FFN_v(g'_f)),\\
+\kappa_f&=w_c^{\mathsf T}\widehat g_f+b_c.
+\label{eq:confidence-head}
+\end{align}
+Here $G$ is the sequence of $g_f$ states. For temperature $\tau_c>0$,
+the predicted confidence is
+\begin{equation}
+C_f=\sigma(\kappa_f/\tau_c).
+\end{equation}
+This prediction uses only the visual prefix and causally available text.
+
+\section{Stage I: supervised prediction and regularization}
+
+Batch index $b$ is restored in this section. Every average excludes
+padding. Here $N_b$ counts the real-token windows assigned to the batch
+element; for an unsplit video these are all its real-token windows.
+A reduction over an empty eligible set contributes zero.
+
+\subsection{Prediction loss}
+
+Let $\mathcal I$ be the set of valid token queries in a batch, including
+$\EOS$ queries at true video ends. Token-query prediction minimizes
+\begin{equation}
+\mathcal L_{\mathrm{pred}}
+=-\frac{1}{|\mathcal I|}
+ \sum_{(b,i)\in\mathcal I}\log p_{bi}(y_{bi}).
+\label{eq:token-ce}
+\end{equation}
+For frame prediction, let
+$\mathcal J=\{(b,f):f\in\bigcup_{i=1}^{N_b}\mathcal W_{bi}\}$ and
+let $y_{b,f}^{\mathrm{fr}}$ be the unique token whose window contains
+$f$. The loss becomes
+\begin{equation}
+\mathcal L_{\mathrm{pred}}
+=-\frac{1}{|\mathcal J|}
+ \sum_{(b,f)\in\mathcal J}\log p_{bf}^{\mathrm{fr}}(y_{b,f}^{\mathrm{fr}}).
+\label{eq:frame-ce}
+\end{equation}
+Thus a longer real-token window contributes more supervised positions
+in the frame variant.
+
+\subsection{Projection geometry and norms}
+
+For an eligible example, let the rows of $X\in\R^{L\times d_x}$ be
+unprojected states and the rows of $H\in\R^{L\times d}$ their projected
+counterparts. Define
+\begin{equation}
+\widetilde X_r=\frac{X_r}{\max(\norm{X_r}_2,\eps_n)},\qquad
+\widetilde H_r=\frac{H_r}{\max(\norm{H_r}_2,\eps_n)},
+\qquad \eps_n=10^{-6}.
+\end{equation}
+The geometry and norm penalties for that example are
+\begin{align}
+\mathcal G(X,H)
+ &=\frac{1}{L^2}\norm{\widetilde X\widetilde X^{\mathsf T}
+                     -\widetilde H\widetilde H^{\mathsf T}}_F^2,
+\label{eq:geometry}\\
+\mathcal N(X,H)
+ &=\frac1L\sum_{r=1}^{L}
+ \left(\frac{\norm{H_r}_2}{\norm{X_r}_2+\eps_n}-1\right)^2.
+\label{eq:norm}
+\end{align}
+Equation~\eqref{eq:geometry} preserves pairwise cosine similarities;
+Equation~\eqref{eq:norm} preserves individual feature magnitudes.
+
+For video, use all valid $(v_f,\bar v_f)$ pairs. For text in the
+token-query variants, use all supervised $(q_i,\bar q_i)$ pairs,
+including a true-end $\EOS$ query. In the frame variant, use the full
+valid teacher-state sequence $(z_j,\bar z_j)$. Only examples containing
+at least one supervised prediction position are eligible. Averaging
+\emph{per-example} penalties over these examples defines
+$\mathcal L_{v,\mathrm{geom}}$, $\mathcal L_{t,\mathrm{geom}}$,
+$\mathcal L_{v,\mathrm{norm}}$, and $\mathcal L_{t,\mathrm{norm}}$.
+
+\subsection{Attention and cross-modal magnitude penalties}
+
+These penalties apply only to token-query variants. Let
+\begin{equation}
+\overline A_{bif}=\frac1H\sum_{h=1}^{H}A^h_{bif},\qquad
+\mu_{bi}=\sum_{f=0}^{F_b-1}f\,\overline A_{bif},
+\end{equation}
+where $A^h$ is the text-to-video attention from
+\eqref{eq:attention}. For examples with at least two real-token
+windows, define
+\begin{equation}
+\mathcal L_{\mathrm{mono}}
+=\frac{1}{|\mathcal B_2|}\sum_{b\in\mathcal B_2}
+ \frac{1}{N_b-1}\sum_{i=1}^{N_b-1}
+ \pos{\mu_{bi}-\mu_{b,i+1}},
+\quad \mathcal B_2=\{b:N_b\geq2\}.
+\label{eq:monotonic}
+\end{equation}
+Here $[x]_+=\max(x,0)$. This discourages backward movement of the
+attention mean; it does not require a strictly positive step.
+
+Let $\mathcal W$ index all real-token windows in the batch. The
+aligned-window penalty is
+\begin{equation}
+\mathcal L_{\mathrm{align}}
+=-\frac{1}{|\mathcal W|}\sum_{(b,i)\in\mathcal W}
+ \log\!\left(\max\!\left\{
+     \sum_{f=a_{bi}}^{e_{bi}}\overline A_{bif},\,10^{-8}
+ \right\}\right).
+\label{eq:aligned}
+\end{equation}
+Both attention penalties exclude $\EOS$. Alignment averages over
+windows, while monotonicity first averages adjacent pairs within each
+eligible example.
+
+For a prescribed margin $m\geq0$, the cross-modal magnitude penalty is
+\begin{equation}
+\mathcal L_{\mathrm{cross}}
+=\frac1{|\mathcal I|}\sum_{(b,i)\in\mathcal I}
+ \pos{m-\norm{c_{bi}}_2}^{\,2}.
+\end{equation}
+This penalty includes true-end $\EOS$ queries and discourages a
+text-to-video contribution with norm below $m$.
+
+\subsection{Combined first-stage objective}
+
+The full objective is
+\begin{align}
+\mathcal L_{\mathrm I}={}&\mathcal L_{\mathrm{pred}}
+ +\lambda_{v,g}\mathcal L_{v,\mathrm{geom}}
+ +\lambda_{t,g}\mathcal L_{t,\mathrm{geom}}\notag\\
+ &+\lambda_{v,n}\mathcal L_{v,\mathrm{norm}}
+ +\lambda_{t,n}\mathcal L_{t,\mathrm{norm}}\notag\\
+ &+\lambda_{\mathrm{mono}}\mathcal L_{\mathrm{mono}}
+ +\lambda_{\mathrm{align}}\mathcal L_{\mathrm{align}}
+ +\lambda_{\mathrm{cross}}\mathcal L_{\mathrm{cross}}.
+\label{eq:stage-one}
+\end{align}
+The default objective has $\lambda_{v,n}=\lambda_{t,n}=0.01$ and all
+other regularization coefficients equal to zero. The frame variant
+requires $\lambda_{\mathrm{mono}}=\lambda_{\mathrm{align}}
+=\lambda_{\mathrm{cross}}=0$, since it has no text-to-video branch.
+Confidence-only transformations do not enter this objective.
+
+\section{Stage II: confidence from a frozen predictor}
+
+\subsection{Window-relative causal predictions}
+
+After Stage~I, freeze every parameter affecting token or frame logits.
+For a real-token window $i$, define
+\begin{equation}
+L_i=e_i-a_i+1,\qquad b_i=L_i-1,\qquad
+f(i,t)=a_i+t,\quad 0\leq t\leq b_i.
+\end{equation}
+The symbol $b_i$ is the final relative timestep, not a batch index.
+
+For token-query variants, hold $q_i$ fixed and reevaluate its prediction
+at every frame in the window, replacing \eqref{eq:t2v} by
+\begin{equation}
+M^{t\to v,(i,t)}_{f}=\ind\{0\leq f\leq a_i+t\}.
+\end{equation}
+Denote the resulting frozen logits by $\ell^*_{i,t}$. For the frame
+variant, $\ell^*_{i,t}$ is the frozen frame logit at $f=a_i+t$,
+using the text-availability mask \eqref{eq:v2t}. These distributions
+use teacher-forced text history with commits at aligned window ends.
+
+With token temperature $\tau_y>0$, form
+\begin{equation}
+P_{i,t}=\softmax(\ell^*_{i,t}/\tau_y),\qquad
+Y_{i,t,v}=\frac{\max(P_{i,t,v},\eps_y)}
+ {\sum_{u=1}^{V}\max(P_{i,t,u},\eps_y)},
+\quad \eps_y=10^{-8}.
+\label{eq:target-dist}
+\end{equation}
+The coordinates $(i,t)$ range only over real-token windows; there
+are no confidence targets for gaps, padding, or $\EOS$.
+
+\subsection{Uncertainty and future-distribution instability}
+
+All logarithms are natural. Normalized token entropy is
+\begin{equation}
+U_{i,t}=\frac{-\sum_{v=1}^{V}Y_{i,t,v}\log Y_{i,t,v}}{\log V}.
+\label{eq:entropy}
+\end{equation}
+For every admissible future offset $u\in\{0,\ldots,b_i-t\}$, set
+\begin{align}
+M_{i,t,u}&=\tfrac12(Y_{i,t}+Y_{i,t+u}),\\
+D_{i,t,u}&=\JS(Y_{i,t},Y_{i,t+u})\notag\\
+ &=\tfrac12\KL(Y_{i,t}\Vert M_{i,t,u})
+   +\tfrac12\KL(Y_{i,t+u}\Vert M_{i,t,u}),
+\label{eq:js}
+\end{align}
+where $\KL(p\Vert q)=\sum_v p_v\log(p_v/q_v)$.
+Then $0\leq D_{i,t,u}\leq\log2$ and $D_{i,t,0}=0$.
+
+For decay $\gamma\geq0$, the future-offset weights are
+\begin{equation}
+w_{i,t,u}=\frac{e^{-\gamma u}}
+ {\sum_{r=0}^{b_i-t}e^{-\gamma r}},\qquad
+\sum_{u=0}^{b_i-t}w_{i,t,u}=1.
+\end{equation}
+The default $\gamma=0$ gives uniform weights, including the
+current distribution at $u=0$. With $\beta>0$, the mathematical
+instability aggregate is
+\begin{equation}
+Q_{i,t}=\frac1\beta\log\left(
+ \sum_{u=0}^{b_i-t}w_{i,t,u}e^{\beta D_{i,t,u}}\right).
+\label{eq:instability}
+\end{equation}
+For normalized weights, $0\leq Q_{i,t}\leq\log2$.
+For fixed positive weights its limiting forms are
+\begin{equation}
+\lim_{\beta\to0^+}Q_{i,t}
+ =\sum_u w_{i,t,u}D_{i,t,u},\qquad
+\lim_{\beta\to\infty}Q_{i,t}=\max_u D_{i,t,u}.
+\end{equation}
+
+The evaluated aggregate uses a logarithmic weight floor:
+\begin{equation}
+Q^{\eps}_{i,t}=\frac1\beta\log\left(
+ \sum_{u=0}^{b_i-t}\max(w_{i,t,u},10^{-8})
+                         e^{\beta D_{i,t,u}}\right).
+\label{eq:instability-floor}
+\end{equation}
+The floored weights are not renormalized. Therefore the target includes
+clipping even though the unfloored normalized quantities are bounded.
+For mixing coefficient $\lambda\in[0,1]$, define
+\begin{equation}
+S_{i,t}=\clip_{[0,1]}\!\left(
+  \lambda U_{i,t}+(1-\lambda)\frac{Q^{\eps}_{i,t}}{\log2}
+\right),\qquad
+s_{i,t}=1-S_{i,t}.
+\label{eq:soft-target}
+\end{equation}
+Here $\lambda$ is the entropy/instability mixture coefficient, distinct
+from the Stage~I regularization coefficients. The defaults are
+$\beta=10$, $\lambda=0.5$, $\gamma=0$, and $\tau_y=1$.
+
+At the last timestep, only $u=0$ remains, so $Q^{\eps}_{i,b_i}=0$
+and $s_{i,b_i}=1-\lambda U_{i,b_i}$. The target measures predictive
+certainty and stability; it does not directly compare the predicted
+token with the true token. Future distributions enter target
+construction only. The confidence predictor itself remains causal.
+
+\subsection{Confidence loss and parameter separation}
+
+Pack each frame confidence into the same window-relative coordinates:
+\begin{equation}
+C_{bi,t}=\sigma(\kappa_{b,a_{bi}+t}/\tau_c),\qquad
+\mathcal T=\{(b,i,t):i\text{ is real},\ 0\leq t\leq b_{bi}\}.
+\end{equation}
+With $\eps_c=10^{-7}$, the optimized loss is
+\begin{align}
+\mathcal L_{\mathrm{II}}
+=-\frac1{|\mathcal T|}\sum_{(b,i,t)\in\mathcal T}
+\bigl[&\sg(s_{bi,t})\log\max(C_{bi,t},\eps_c)\notag\\
+ &+(1-\sg(s_{bi,t}))\log\max(1-C_{bi,t},\eps_c)\bigr].
+\label{eq:confidence-loss}
+\end{align}
+The default confidence temperature is $\tau_c=1$. This is an average
+over valid timesteps, so longer windows have greater total weight.
+
+Let $\theta$ contain all parameters that affect token/frame predictions
+and $\phi$ contain the parameters exclusive to confidence prediction.
+During Stage~II,
+\begin{equation}
+\theta=\theta^*,\qquad
+\min_{\phi}\mathcal L_{\mathrm{II}}(\phi;\theta^*),\qquad
+\nabla_\phi s_{bi,t}=0.
+\end{equation}
+Both encoders, both modality projections, and the token-prediction
+transformations stay fixed and deterministic. The video-side
+normalizations, causal self-attention, feed-forward transformation,
+and scalar confidence head are trainable. Video-to-text attention is
+also trainable in token-query variants; in the frame variant it must
+remain fixed because it also determines frame-token logits. Dropout
+is active only in the trainable confidence transformations.
+
+\section{Algorithmic training and sequence sections}
+
+\subsection{Optimization procedure}
+
+Stage~I repeatedly constructs the aligned causal predictions and
+minimizes \eqref{eq:stage-one}. An imported language model remains
+fixed unless its fine-tuning is selected. Once prediction training
+finishes, Stage~II constructs \eqref{eq:target-dist}--\eqref{eq:soft-target}
+with the frozen predictor and minimizes \eqref{eq:confidence-loss} over
+the confidence parameters. A batch with no eligible supervised
+positions is skipped for the corresponding stage. Updating the
+prediction parameters changes the distributions defining the
+confidence targets and therefore requires fitting confidence again.
+
+Both stages use gradient norm clipping and AdamW, with separate
+optimization states. For the active parameter vector $\vartheta$ and
+loss $\mathcal L$, clipping at threshold $c>0$ gives
+\begin{equation}
+g_k=\nabla_{\vartheta}\mathcal L(\vartheta_{k-1}),\qquad
+\widetilde g_k=g_k\min\!\left(1,\frac{c}{\norm{g_k}_2+10^{-6}}\right).
+\end{equation}
+With moments initialized at zero, the update is
+\begin{align}
+m_k&=\beta_1m_{k-1}+(1-\beta_1)\widetilde g_k,\\
+r_k&=\beta_2r_{k-1}+(1-\beta_2)\widetilde g_k^{\odot2},\\
+\widehat m_k&=m_k/(1-\beta_1^k),\qquad
+\widehat r_k=r_k/(1-\beta_2^k),\\
+\vartheta_k
+ &=(1-\eta\omega)\vartheta_{k-1}
+   -\eta\,\frac{\widehat m_k}{\sqrt{\widehat r_k}+\eps_{\mathrm{opt}}}.
+\end{align}
+Products, square roots, and division in the adaptive term are
+coordinatewise. Here $\eta$ is the stage-specific learning rate and
+$\omega$ the decoupled weight-decay coefficient. The moment parameters
+are $\beta_1=0.9$, $\beta_2=0.999$, and $\eps_{\mathrm{opt}}=10^{-8}$.
+Frozen parameters and parameters outside the active loss path receive
+no update.
+
+\subsection{Optional division into video sections}
+\label{sec:sections}
+
+If a video is divided into consecutive sections $[r,s)$, the previous
+equations apply with local frame index $f'=f-r$ and the following
+supervision rules. Token-query targets are assigned exactly once, to
+the section containing their endpoint:
+\begin{equation}
+\mathcal I_{[r,s)}=\{i:r\leq e_i<s\},\qquad
+[a_i',e_i']=[\max(a_i,r)-r,\ e_i-r].
+\end{equation}
+Let $K=|\{i:e_i<r\}|$ and $M=|\mathcal I_{[r,s)}|$.
+The text encoder still receives
+$(\BOS,y_1,\ldots,y_{K+M})$, and the selected prediction queries are
+$z_K,\ldots,z_{K+M-1}$. If $s=F$, also include the $\EOS$ query
+$z_{K+M}$ with local window $\{s-r-1\}$.
+Text availability is translated, rather than reset:
+\begin{equation}
+\alpha'_0=-r,\qquad \alpha'_j=e_j+1-r.
+\end{equation}
+Previously committed text may consequently have negative availability
+times and is visible from the start of the section.
+
+Frame prediction uses every nonempty intersection
+\begin{equation}
+\mathcal W_i\cap[r,s),\qquad
+[a_i',e_i']=[\max(a_i,r)-r,\ \min(e_i,s-1)-r],
+\end{equation}
+including a token that finishes in a later section. Confidence uses
+the clipped assigned windows for token-query variants, and all
+nonempty window intersections for the frame variant. Its future
+offsets terminate at the end of that local window.
+
+The full preceding text prefix is retained, but visual temporal
+context and visual positions begin anew in each section. The mouth
+crop remains the one selected at the original video's first frame.
+Thus section-based learning has a shorter visual context than
+full-video learning, and clipping may also shorten the horizon used
+to construct confidence targets.
+
+\subsection{Causal sequential realization}
+
+Within the chosen visual context, frame $f$ produces $v_f$ from frames
+through $f$ and combines it with text states committed before its
+video-to-text attention step. A token query predicts from all visual
+states observed so far. Appending a committed token creates a new
+causal text state, which becomes available to subsequent video steps.
+Convolutions retain only past inputs, and attention admits only the
+keys allowed by the corresponding causal mask.
+
+With deterministic transformations, these sequential operations
+evaluate the same causal functions as the masked equations for the
+same video context and text-commit history. Confidence target
+construction uses the aligned teacher-forced history; a generated
+history with different tokens or commit times defines different
+conditioning information.
+
+\end{document}
