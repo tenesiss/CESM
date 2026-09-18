@@ -15,6 +15,7 @@
 !hdtf_download.py
 !flash_mono.py
 !tests/
+!tests/evaluate_checkpoints.py
 !tests/train_*
 !tests/test_download_recovery.py
 !tests/test_run_all_variants.py
