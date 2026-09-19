@@ -35,6 +35,7 @@ MANAGED = {"help", "manifest", "output", "resume", "confidence_only",
            "text_fusion", "variant_name", "metrics_csv"}
 DOWNLOAD_ONLY = {"num_videos", "prepare_only", "login", "logout"}
 SPECIFIC = {"lambda_tcross": {2}, "tcross_margin": {2}, "w_t": {4},
+            "vcross_weight": {5}, "window_phasing": {5},
             "lambda_mono": {1, 2, 3, 4}, "lambda_align": {1, 2, 3, 4},
             "flash_mono": {1, 2, 3, 4}}
 
@@ -143,6 +144,10 @@ def validate_training_args(parser, args):
             parser.error(f"--{key.replace('_', '-')} must be finite and >= 0")
     if not math.isfinite(args.w_t) or not 0 <= args.confidence_lambda <= 1:
         parser.error("--w-t must be finite and --confidence-lambda must be in [0,1]")
+    if args.vcross_weight is not None and not math.isfinite(args.vcross_weight):
+        parser.error("--vcross-weight must be finite")
+    if not math.isfinite(args.window_phasing) or not 0 <= args.window_phasing <= 1:
+        parser.error("--window-phasing must be finite and in [0,1]")
     if args.fine_tune_pretrained_lm and not args.pretrained_lm:
         parser.error("--fine-tune-pretrained-lm requires shared --pretrained-lm")
 

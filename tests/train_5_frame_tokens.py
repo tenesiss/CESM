@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Variant 5: ht = text_ln(hv0 + vcross), producing one token distribution per frame."""
+"""Variant 5: ht = text_ln(hv0 + vcross_weight * vcross), with per-frame token logits."""
 
 import sys
 from pathlib import Path

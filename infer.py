@@ -19,6 +19,8 @@ Token commitment is driven by the learned per-frame confidence head. The base
 confidence threshold can relax as more frames pass since the previous commit.
 Relaxation can reduce delays, but candidates must still reach the threshold floor
 and satisfy the warmup, frame-gap and optional probability/stability guards.
+Repeated token IDs must also wait a configurable number of frames since their
+own last emission. Predictions during this cooldown are skipped.
 While the same next-token candidate remains active, its peak confidence is kept;
 this lets a later relaxed threshold accept an earlier peak. Confidence is trained
 from token entropy and future-distribution instability, not explicit boundaries.
@@ -83,6 +85,8 @@ def main(args) -> None:
         raise SystemExit("--confidence-relax-per-frame must be >= 0")
     if args.confidence_relax_after < 0 or args.min_frames_per_token < 0:
         raise SystemExit("frame-count commit arguments must be >= 0")
+    if args.repeat_token_cooldown_frames < 0:
+        raise SystemExit("--repeat-token-cooldown-frames must be >= 0")
     if args.stable_frames < 1:
         raise SystemExit("--stable-frames must be >= 1")
     if not (0.0 <= args.min_token_prob <= 1.0):
@@ -94,6 +98,11 @@ def main(args) -> None:
         device = torch.device(args.device)
 
     model, tokenizer, preprocess, ckpt = load_model(args.checkpoint, device)
+    # Match the arithmetic used to train the projections and token head. A
+    # stored BF16 text encoder may have run under FP16 CUDA autocast during
+    # training; its parameter dtype alone does not determine that precision.
+    amp_requested = args.amp if args.amp is not None else bool(ckpt.get("training_args", {}).get("amp", False))
+    amp_enabled = bool(amp_requested and device.type == "cuda")
     confidence_meta = ckpt.get("confidence", {})
     # Unless explicitly overridden, use the same temperatures that defined Y
     # and C during confidence training. Older checkpoints fall back to 1.0.
@@ -143,7 +152,7 @@ def main(args) -> None:
     # variants reuse its query as video K/V grows; frame fusion queries the
     # cached text from each arriving frame.
     bos = torch.tensor([tokenizer.bos_id], dtype=torch.long, device=device)
-    with torch.inference_mode():
+    with torch.inference_mode(), torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
         state = model.stream_push_text_token(bos, state)
 
     candidate: Optional[int] = None
@@ -155,6 +164,7 @@ def main(args) -> None:
     frame_idx = -1
     # Treat stream start like a virtual commit immediately before frame 0.
     last_emit_frame = -1
+    last_emit_frame_by_token: dict[int, int] = {}
     ended = False
     started_wall = time.perf_counter()
 
@@ -164,17 +174,20 @@ def main(args) -> None:
             "video": str(Path(args.video)),
             "fps": fps,
             "device": str(device),
+            "amp": amp_enabled,
+            "amp_dtype": str(torch.get_autocast_dtype(device.type)) if amp_enabled else None,
             "checkpoint_epoch": ckpt.get("epoch"),
             "confidence_epoch": ckpt.get("confidence_epoch"),
             "confidence_trained": bool(confidence_meta.get("trained", False)),
             "confidence_threshold": args.confidence_threshold,
             "confidence_min_threshold": args.confidence_min_threshold,
             "confidence_relax_per_frame": args.confidence_relax_per_frame,
+            "repeat_token_cooldown_frames": args.repeat_token_cooldown_frames,
             "token_temperature": token_temperature,
             "confidence_temperature": conf_temperature,
         }), flush=True)
 
-    with torch.inference_mode():
+    with torch.inference_mode(), torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
         while True:
             frame_wall = time.perf_counter()
             ok, frame_bgr = cap.read()
@@ -186,20 +199,28 @@ def main(args) -> None:
             conf_logit, state = model.stream_push_video_frame(frame, state)
             token_logits, attn = model.stream_predict_next(state)
             token_logits = mask_invalid_generation_logits(token_logits[:, -1], tokenizer)
-            probs = torch.softmax(token_logits / token_temperature, dim=-1)
+            probs = torch.softmax(token_logits.float() / token_temperature, dim=-1)
             prob, tok = probs.max(dim=-1)
             tok_id = int(tok.item())
             tok_prob = float(prob.item())
-            conf_prob = float(torch.sigmoid(conf_logit[:, -1] / conf_temperature).item())
+            conf_prob = float(torch.sigmoid(conf_logit[:, -1].float() / conf_temperature).item())
 
             frames_since_commit = frame_idx - last_emit_frame
             enough_gap = frames_since_commit >= args.min_frames_per_token
             warm = frame_idx + 1 >= args.warmup_frames
             probability_ok = tok_prob >= args.min_token_prob
+            token_last_emit_frame = last_emit_frame_by_token.get(tok_id)
+            repeat_ok = (
+                token_last_emit_frame is None
+                or frame_idx - token_last_emit_frame >= args.repeat_token_cooldown_frames
+            )
 
             # A transient confidence drop must not reset a stable candidate's
-            # peak. Changing argmax or failing the probability guard does reset it.
-            if probability_ok:
+            # peak. Changing argmax or failing a guard does reset it. A token
+            # in cooldown skips this frame's prediction without choosing a
+            # runner-up or accumulating confidence/stability for a later commit.
+            # Video caches, diagnostics and real-time pacing still advance.
+            if probability_ok and repeat_ok:
                 if candidate == tok_id:
                     candidate_streak += 1
                     if conf_prob > candidate_peak_conf:
@@ -260,6 +281,7 @@ def main(args) -> None:
                     break
 
                 emitted_ids.append(committed)
+                last_emit_frame_by_token[committed] = frame_idx
                 token_text = tokenizer.decode([committed])
                 emit_event(args, {
                     "event": "token",
@@ -294,6 +316,7 @@ def main(args) -> None:
                     f"\n[frame={frame_idx} t={frame_idx/fps:.2f}s next={top_text!r} "
                     f"p={tok_prob:.3f} conf={conf_prob:.3f} peak_conf={candidate_peak_conf:.3f} "
                     f"commit_thr={effective_conf_threshold:.3f} since_commit={frames_since_commit} "
+                    f"repeat_ok={repeat_ok} "
                     f"attn_mu={mu:.1f}]",
                     file=sys.stderr,
                     flush=True,
@@ -311,16 +334,22 @@ def main(args) -> None:
     # Frame fusion is excluded: new token logits require a new video frame.
     if (model.cfg.text_fusion != "frame" and not ended
             and args.flush_tokens > 0 and len(emitted_ids) < args.max_tokens):
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
             for _ in range(args.flush_tokens):
                 logits, _ = model.stream_predict_next(state)
                 logits = mask_invalid_generation_logits(logits[:, -1], tokenizer)
-                probs = torch.softmax(logits / token_temperature, dim=-1)
+                probs = torch.softmax(logits.float() / token_temperature, dim=-1)
                 prob, tok = probs.max(dim=-1)
                 tid = int(tok.item())
                 if tid == tokenizer.eos_id:
                     break
+                token_last_emit_frame = last_emit_frame_by_token.get(tid)
+                if (token_last_emit_frame is not None
+                        and frame_idx - token_last_emit_frame < args.repeat_token_cooldown_frames):
+                    # Flushing cannot advance the frame clock or clear a cooldown.
+                    break
                 emitted_ids.append(tid)
+                last_emit_frame_by_token[tid] = frame_idx
                 emit_event(args, {
                     "event": "flush_token",
                     "frame": frame_idx,
@@ -361,6 +390,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--video", required=True)
     p.add_argument("--device", default="auto")
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None,
+                   help="Override CUDA mixed precision (default: restore the checkpoint training setting; --no-amp disables it)")
     p.add_argument("--no-face-detector", action="store_true")
 
     # Learned confidence is the primary token-commit decision. With
@@ -377,6 +408,9 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Optional argmax stability guard; 1 lets confidence alone decide timing")
     p.add_argument("--warmup-frames", type=int, default=3)
     p.add_argument("--min-frames-per-token", type=int, default=2)
+    p.add_argument("--repeat-token-cooldown-frames", type=int, default=5,
+                   help="Minimum frame-index gap since the same token ID was last emitted; "
+                        "skip earlier predictions even if other tokens intervened (default: 5; 0 disables)")
     p.add_argument("--min-token-prob", type=float, default=0.0,
                    help="Optional sanity floor for next-token probability; 0 disables it")
     # Backward-compatible spelling from the first prototype.

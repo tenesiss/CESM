@@ -10,7 +10,7 @@ model/training implementation in `../train.py`; keep them inside this repository
 | `train_2_tcross_loss.py` | `text_ln(ht0 + tcross)` | `lambda_tcross * mean(ReLU(m - norm(tcross_t, 2))**2)` |
 | `train_3_no_ht0.py` | `text_ln(tcross)` | None |
 | `train_4_weighted_ht0.py` | `text_ln(w_t * ht0 + tcross)` | None |
-| `train_5_frame_tokens.py` | `text_ln(hv0 + vcross)` | Frame cross entropy replaces token cross entropy |
+| `train_5_frame_tokens.py` | `text_ln(hv0 + vcross_weight * vcross)` | Frame cross entropy replaces token cross entropy |
 
 The original token loss, projection losses, attention losses, text encoder and
 confidence stage keep their existing defaults. Variant 3 removes only the `ht0`
@@ -31,7 +31,9 @@ choose another value for a distinct experiment. `0.0` has the same fusion as
 variant 3. The current value is logged as `w_t`.
 
 For variant 5, `vcross = video_cross(hv0, ht0)` uses frames as queries and
-causally available text as keys/values. The text FFN and token head then produce
+causally available text as keys/values. `--vcross-weight` sets its fixed multiplier
+in token fusion (default `1.0`; `0.0` gives video-only token predictions).
+The text FFN and token head then produce
 `[B, F, V]` logits. There is no `text_cross` module or `tcross` computation.
 Each frame inside a supplied token window is labeled with that token. Unlabeled
 frames and padding are excluded from both cross entropy and metrics; no EOS label
@@ -39,11 +41,28 @@ overwrites the last spoken token. Windows crossing a `--max-frames` boundary
 supervise frames on both sides. The current token is hidden from attention until
 the frame after its window ends, preserving the existing causal teacher forcing.
 
+Variant 5 also accepts `--window-phasing FRACTION` (default `0`, range `[0,1]`).
+For the first `floor(FRACTION * original_window_length)` frames of each window
+after the first, the frame loss is `0.5 * CE(current) + 0.5 * CE(previous)`.
+Equivalently, the last phased zero-based offset is
+`floor(FRACTION * original_window_length) - 1`. Each frame still counts once
+in the batch mean. Phasing never restarts at a section boundary and never labels
+gaps or padding. Repeated tokens reduce to ordinary CE. Metrics keep scoring
+the current token; confidence windows and causal teacher timing stay the same.
+The checkpoint records the fraction; pass it again on resume to retain it.
+
 Projection losses retain their defaults. `--lambda-tcross`, `--lambda-mono`, and
 `--lambda-align` must remain zero in variant 5 because there is no text-to-video
 attention. `--flash-mono` has no effect on this variant. Its confidence stage
 also freezes `video_cross`, which now participates in token prediction, and
 uses frame distributions within the labeled windows for its targets.
+
+All variants support `--no-vproj`, which uses the video encoder features as
+`hv0` directly, sets fusion width to `--d-video` instead of `--d-fusion`, and
+projects text to that width. Video projection penalties are skipped in this
+mode. The checkpoint saves this architecture and the frame `vcross` weight;
+inference and resume restore them. The confidence branch retains its own text
+attention, even when the frame token-fusion weight is zero.
 
 ## Run
 
@@ -161,6 +180,8 @@ apply to all variants. Experiment-specific options route as follows:
 | --- | --- |
 | `--tcross-margin`, `--lambda-tcross` | 2 only |
 | `--w-t` | 4 only |
+| `--vcross-weight`, `--window-phasing` | 5 only |
+| `--no-vproj` | All variants |
 | `--lambda-mono`, `--lambda-align`, `--flash-mono` | 1–4 only |
 
 Use repeated `--variant-args 'N:FLAGS'` for independent hyperparameters:

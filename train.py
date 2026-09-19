@@ -140,6 +140,8 @@ class ModelConfig:
     pretrained_lm_local_files_only: bool = False
     text_fusion: str = "residual"
     text_residual_weight: float = 1.0
+    use_video_projection: bool = True
+    frame_vcross_weight: float = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -576,14 +578,18 @@ class VideoTextWindowDataset(Dataset):
         use_face_detector: bool = True,
         max_frames: Optional[int] = None,
         video_dtype: torch.dtype = torch.float32,
+        window_phasing: float = 0.0,
     ):
         if max_frames is not None and max_frames <= 0:
             raise ValueError("--max-frames must be > 0")
+        if not math.isfinite(window_phasing) or not 0 <= window_phasing <= 1:
+            raise ValueError("--window-phasing must be finite and in [0,1]")
         self.rows = list(rows)
         self.tokenizer = tokenizer
         self.mouth_size = mouth_size
         self.use_face_detector = use_face_detector
         self.video_dtype = video_dtype
+        self.window_phasing = window_phasing
         self.sections: Optional[List[Tuple[int, int, int, int]]] = None
         if max_frames is not None:
             # Index before batching so batch_size counts sections, not videos.
@@ -774,13 +780,21 @@ class VideoTextWindowDataset(Dataset):
         # Frame supervision intersects every original window, including tokens
         # that finish in a later section. Gaps have no known true class.
         frame_targets = torch.full((Fv,), self.tokenizer.pad_id, dtype=torch.long)
+        frame_previous_targets = torch.full_like(frame_targets, self.tokenizer.pad_id)
         frame_windows = []
-        for token_id, (start, end) in zip(all_token_ids, all_token_windows):
-            start = max(start, start_frame) - start_frame
-            end = min(end, start_frame + Fv - 1) - start_frame
+        for token_idx, (token_id, (window_start, window_end)) in enumerate(zip(all_token_ids, all_token_windows)):
+            start = max(window_start, start_frame) - start_frame
+            end = min(window_end, start_frame + Fv - 1) - start_frame
             if start <= end:
                 frame_targets[start:end + 1] = token_id
                 frame_windows.append((start, end))
+                # Compute the inclusive phase endpoint on the original window,
+                # before section clipping. Never restart phasing at a cut.
+                phase_last = math.floor(self.window_phasing * (window_end - window_start + 1)) - 1
+                if token_idx > 0 and phase_last >= 0:
+                    phase_end = min(end, window_start + phase_last - start_frame)
+                    if start <= phase_end:
+                        frame_previous_targets[start:phase_end + 1] = all_token_ids[token_idx - 1]
 
         return {
             "video": mouth,
@@ -796,6 +810,7 @@ class VideoTextWindowDataset(Dataset):
             "path": row["video"],
             "sample_index": idx,
             "frame_targets": frame_targets,
+            "frame_previous_targets": frame_previous_targets,
             "frame_windows": torch.tensor(frame_windows, dtype=torch.long).reshape(-1, 2),
         }
 
@@ -820,6 +835,7 @@ def make_collate(pad_id: int):
         query_starts = torch.zeros(B, dtype=torch.long)
         window_counts = torch.zeros(B, dtype=torch.long)
         frame_targets = torch.full((B, max_f), pad_id, dtype=torch.long)
+        frame_previous_targets = torch.full_like(frame_targets, pad_id)
         max_fw = max(1, max(len(x.get("frame_windows", [])) for x in batch))
         frame_windows = torch.zeros(B, max_fw, 2, dtype=torch.long)
         frame_window_counts = torch.zeros(B, dtype=torch.long)
@@ -840,6 +856,8 @@ def make_collate(pad_id: int):
             window_counts[b] = item.get("window_count", max(0, tq - 1))
             if "frame_targets" in item:
                 frame_targets[b, :fv] = item["frame_targets"]
+                if "frame_previous_targets" in item:
+                    frame_previous_targets[b, :fv] = item["frame_previous_targets"]
                 fw = len(item["frame_windows"])
                 frame_windows[b, :fw] = item["frame_windows"]
                 frame_window_counts[b] = fw
@@ -859,6 +877,7 @@ def make_collate(pad_id: int):
             "texts": [x["text"] for x in batch],
             "sample_indices": [x.get("sample_index") for x in batch],
             "frame_targets": frame_targets,
+            "frame_previous_targets": frame_previous_targets,
             "frame_windows": frame_windows,
             "frame_window_counts": frame_window_counts,
         }
@@ -1452,8 +1471,10 @@ class PretrainedLMTextEncoder(nn.Module):
 class MixedBlock(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        df = cfg.d_fusion
-        self.vproj = nn.Linear(cfg.d_video, df, bias=False)
+        # Without vproj, every fusion operation lives in the encoder's video
+        # feature space; text must be mapped to that same width.
+        df = cfg.d_fusion if cfg.use_video_projection else cfg.d_video
+        self.vproj = nn.Linear(cfg.d_video, df, bias=False) if cfg.use_video_projection else nn.Identity()
         self.tproj = nn.Linear(cfg.d_text, df, bias=False)
         self.text_cross = (
             None if cfg.text_fusion == "frame" else MultiHeadAttention(df, cfg.heads, cfg.dropout)
@@ -1473,6 +1494,10 @@ class MixedBlock(nn.Module):
         if cfg.text_fusion not in ("residual", "cross_only", "weighted", "frame"):
             raise ValueError(f"Unsupported text_fusion: {cfg.text_fusion!r}")
         self.text_fusion = cfg.text_fusion
+        if not math.isfinite(cfg.frame_vcross_weight):
+            raise ValueError("frame_vcross_weight must be finite")
+        # Stored in ModelConfig, so older checkpoints need no new state tensor.
+        self.frame_vcross_weight = cfg.frame_vcross_weight
         if self.text_fusion == "weighted":
             if not math.isfinite(cfg.text_residual_weight):
                 raise ValueError("text_residual_weight must be finite")
@@ -1488,7 +1513,7 @@ class MixedBlock(nn.Module):
 
     def frame_logits(self, hv0: torch.Tensor, vcross: torch.Tensor) -> torch.Tensor:
         """Classify frames; projected text contributes through video->text attention."""
-        ht = self.text_ln(hv0 + vcross)
+        ht = self.text_ln(hv0 + self.frame_vcross_weight * vcross)
         ht_hat = self.text_ffn_ln(ht + self.text_ffn(ht))
         return self.token_head(ht_hat)
 
@@ -2364,27 +2389,51 @@ def document_confidence_loss(
     return loss, stats
 
 
-def token_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> torch.Tensor:
-    """Bound AMP's FP32 vocabulary intermediates while retaining exact masking."""
+def token_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pad_id: int,
+    previous_targets: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Mean over valid positions, with equal current/previous CE during phasing.
+
+    Keep targets sparse and bound AMP's FP32 vocabulary intermediates. A phased
+    frame still counts once in the denominator, including repeated token IDs.
+    """
     logits = logits.reshape(-1, logits.shape[-1])
     targets = targets.reshape(-1)
+    if previous_targets is not None:
+        previous_targets = previous_targets.reshape(-1)
     count = (targets != pad_id).sum()
     if not count:
         return logits[:0].sum()  # Differentiable zero without summing huge logits.
-    if not torch.is_autocast_enabled(logits.device.type) or logits.shape[0] <= 128:
+    chunked = torch.is_autocast_enabled(logits.device.type) and logits.shape[0] > 128
+    if not chunked and previous_targets is None:
         return F.cross_entropy(logits, targets, ignore_index=pad_id)
 
-    def chunk_loss(values, labels):
-        return F.cross_entropy(values, labels, ignore_index=pad_id, reduction="sum")
+    def chunk_loss(values, labels, previous):
+        if previous is None:
+            return F.cross_entropy(values, labels, ignore_index=pad_id, reduction="sum")
+        # One log-softmax for both sparse labels; no dense [B,F,V] targets.
+        dtype = torch.float32 if values.dtype in (torch.float16, torch.bfloat16) else values.dtype
+        log_probs = F.log_softmax(values, dim=-1, dtype=dtype)
+        current_loss = F.nll_loss(log_probs, labels, ignore_index=pad_id, reduction="none")
+        previous = previous.masked_fill(labels == pad_id, pad_id)
+        previous_loss = F.nll_loss(log_probs, previous, ignore_index=pad_id, reduction="none")
+        return torch.where(previous != pad_id, 0.5 * (current_loss + previous_loss), current_loss).sum()
+
+    if not chunked:
+        return chunk_loss(logits, targets, previous_targets) / count
 
     losses = []
     for start in range(0, logits.shape[0], 128):
         values, labels = logits[start:start + 128], targets[start:start + 128]
+        previous = None if previous_targets is None else previous_targets[start:start + 128]
         if torch.is_grad_enabled() and values.requires_grad:
             # Otherwise autograd retains all chunks' FP32 log-softmax outputs.
-            loss = checkpoint(chunk_loss, values, labels, use_reentrant=False)
+            loss = checkpoint(chunk_loss, values, labels, previous, use_reentrant=False)
         else:
-            loss = chunk_loss(values, labels)
+            loss = chunk_loss(values, labels, previous)
         losses.append(loss)
     return torch.stack(losses).sum() / count
 
@@ -2398,17 +2447,18 @@ def compute_losses(model: UnnobaModel, batch: dict, out: dict, args) -> Dict[str
     active_video_lengths = batch["video_lengths"] * active
     query_lengths = query_lengths * active
     amp_enabled = torch.is_autocast_enabled(out["token_logits"].device.type)
-    token = token_cross_entropy(out["token_logits"], targets, args.pad_id)
+    previous_targets = batch.get("frame_previous_targets") if is_frame and args.window_phasing > 0 else None
+    token = token_cross_entropy(out["token_logits"], targets, args.pad_id, previous_targets)
     zero = token.new_zeros(())
     vproj = similarity_preservation_loss(
         out["video_encoded"], out["video_projected"], active_video_lengths
-    ) if args.lambda_vproj != 0.0 or not amp_enabled else zero
+    ) if model.cfg.use_video_projection and (args.lambda_vproj != 0.0 or not amp_enabled) else zero
     tproj = similarity_preservation_loss(
         out["text_encoded"], out["text_projected"], query_lengths
     ) if args.lambda_tproj != 0.0 or not amp_enabled else zero
     vnorm = norm_preservation_loss(
         out["video_encoded"], out["video_projected"], active_video_lengths
-    ) if args.lambda_vnorm != 0.0 or not amp_enabled else zero
+    ) if model.cfg.use_video_projection and (args.lambda_vnorm != 0.0 or not amp_enabled) else zero
     tnorm = norm_preservation_loss(
         out["text_encoded"], out["text_projected"], query_lengths
     ) if args.lambda_tnorm != 0.0 or not amp_enabled else zero
@@ -2698,6 +2748,10 @@ def train(args) -> None:
             raise ValueError(f"--{option.replace('_', '-')} must be finite and >= 0")
     if not math.isfinite(args.w_t):
         raise ValueError("--w-t must be finite")
+    if args.vcross_weight is not None and not math.isfinite(args.vcross_weight):
+        raise ValueError("--vcross-weight must be finite")
+    if not math.isfinite(args.window_phasing) or not 0 <= args.window_phasing <= 1:
+        raise ValueError("--window-phasing must be finite and in [0,1]")
     if args.max_frames is not None and args.max_frames <= 0:
         raise ValueError("--max-frames must be > 0")
     if args.epochs < 0 or args.confidence_epochs < 0:
@@ -2729,6 +2783,13 @@ def train(args) -> None:
             raise ValueError(
                 f"--resume text fusion {cfg.text_fusion!r} does not match requested "
                 f"{args.text_fusion!r}; use a matching variant checkpoint or train from scratch"
+            )
+        if args.no_vproj and cfg.use_video_projection:
+            raise ValueError("--no-vproj cannot resume a checkpoint with video projection; train from scratch")
+        if args.vcross_weight is not None and args.vcross_weight != cfg.frame_vcross_weight:
+            raise ValueError(
+                f"--resume vcross weight {cfg.frame_vcross_weight:g} does not match requested "
+                f"{args.vcross_weight:g}; omit --vcross-weight to restore the saved weight"
             )
         tokenizer = tokenizer_from_state_dict(resume_ckpt["tokenizer"])
         if cfg.text_encoder_type == "learned":
@@ -2773,7 +2834,7 @@ def train(args) -> None:
             conv3d_channels=args.conv3d_channels,
             d_video=args.d_video,
             d_text=d_text,
-            d_fusion=args.d_fusion,
+            d_fusion=args.d_video if args.no_vproj else args.d_fusion,
             heads=args.heads,
             video_layers=args.video_layers,
             text_layers=args.text_layers,
@@ -2787,7 +2848,13 @@ def train(args) -> None:
             pretrained_lm_local_files_only=args.pretrained_lm_local_files_only,
             text_fusion=args.text_fusion or "residual",
             text_residual_weight=args.w_t,
+            use_video_projection=not args.no_vproj,
+            frame_vcross_weight=1.0 if args.vcross_weight is None else args.vcross_weight,
         )
+    if args.vcross_weight is not None and cfg.text_fusion != "frame":
+        raise ValueError("--vcross-weight requires --text-fusion frame")
+    if args.window_phasing > 0 and cfg.text_fusion != "frame":
+        raise ValueError("--window-phasing requires --text-fusion frame")
     if cfg.text_fusion == "frame" and (args.lambda_tcross or args.lambda_mono or args.lambda_align):
         raise ValueError("Frame fusion requires --lambda-tcross, --lambda-mono and --lambda-align to be 0")
     args.pad_id = tokenizer.pad_id
@@ -2800,6 +2867,7 @@ def train(args) -> None:
         rows, tokenizer, cfg.mouth_size, use_face_detector=not args.no_face_detector,
         max_frames=args.max_frames,
         video_dtype=torch.get_autocast_dtype(device.type) if amp_enabled else torch.float32,
+        window_phasing=args.window_phasing,
     )
     loader = DataLoader(
         ds,
@@ -2855,6 +2923,10 @@ def train(args) -> None:
             f"text_fusion={cfg.text_fusion} lambda_tcross={args.lambda_tcross:g} "
             f"tcross_margin={args.tcross_margin:g}"
         )
+    if not cfg.use_video_projection:
+        print(f"video projection disabled: fusion/text projection width={cfg.d_video}; video projection losses skipped")
+    if cfg.text_fusion == "frame":
+        print(f"frame vcross_weight={cfg.frame_vcross_weight:g} window_phasing={args.window_phasing:g}")
     if args.flash_mono and cfg.text_fusion != "frame":
         print("flash-mono: streamed pre-dropout attention losses; token attention uses SDPA")
 
@@ -3065,7 +3137,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--conv3d-channels", type=int, default=32)
     p.add_argument("--d-video", type=int, default=256)
     p.add_argument("--d-text", type=int, default=256)
-    p.add_argument("--d-fusion", type=int, default=256)
+    p.add_argument("--d-fusion", type=int, default=256,
+                   help="Fusion feature width (ignored with --no-vproj, which uses --d-video)")
+    p.add_argument("--no-vproj", action="store_true",
+                   help="Use video features directly and project text to --d-video; resume restores the saved architecture")
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--video-layers", type=int, default=2)
     p.add_argument("--text-layers", type=int, default=2)
@@ -3074,10 +3149,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument(
         "--text-fusion", choices=("residual", "cross_only", "weighted", "frame"), default=None,
-        help="ht fusion: ht0+tcross, tcross, w_t*ht0+tcross, or per-frame hv0+vcross; resume requires matching fusion",
+        help="ht fusion: ht0+tcross, tcross, w_t*ht0+tcross, or per-frame hv0+vcross_weight*vcross; resume requires matching fusion",
     )
     p.add_argument("--w-t", type=float, default=1.0,
                    help="Fixed scalar w_t for weighted fusion (default: 1); resume restores the saved weight")
+    p.add_argument("--vcross-weight", type=float, default=None,
+                   help="Fixed vcross multiplier for frame token fusion (default: 1; 0 = video-only token prediction); resume restores the saved weight")
+    p.add_argument("--window-phasing", type=float, default=0.0, metavar="FRACTION",
+                   help="Frame fusion only: average current/previous token CE on the first floor(FRACTION * window_length) frames; in [0,1], default 0 (disabled)")
 
     # Projection and attention regularizers.
     p.add_argument("--lambda-vproj", type=float, default=0.0)

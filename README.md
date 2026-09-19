@@ -151,11 +151,24 @@ python3 infer.py \
   --video clips/example.mp4
 ```
 
+On CUDA, inference restores the checkpoint's training `--amp` setting for
+both text and video streaming. Use `--amp` or `--no-amp` to override it. Older
+checkpoints without a saved setting default to disabled; CPU inference also
+disables AMP. `--json-events` reports the active AMP setting and dtype.
+
 Token commitment uses the learned confidence head. Its threshold can relax as
 frames pass since the previous commit, subject to a threshold floor, warmup,
 minimum frame gap, and optional token-probability and stability guards. A
 confidence-trained checkpoint is needed for meaningful commit timing; confidence
 targets measure entropy and future instability rather than explicit boundaries.
+
+`--repeat-token-cooldown-frames N` requires at least `N` frames since the same
+token ID was last emitted (default: `5`; `0` disables the guard). For example,
+with `N=5`, a token emitted at frame 10 can be emitted again starting at frame 15,
+even if other tokens were emitted in between. Earlier predictions of that token
+are skipped without selecting a runner-up or accumulating confidence/stability;
+video processing continues. The optional `--flush-tokens` pass also respects this
+cooldown and stops when its next token is blocked, since no more frames can pass.
 
 ### Resume training
 
@@ -219,6 +232,62 @@ for per-variant overrides and reusing an existing manifest.
 These CSV metrics describe the training samples with the true preceding text
 supplied to the model. They are not held-out or free-running transcription
 scores; see the experiment guide for metric definitions.
+
+### Video projection and frame text contribution
+
+Use `--no-vproj` to pass the video encoder's features directly into fusion.
+The fusion layers then use `--d-video` as their width, and the text projection
+maps from the text encoder's width to `--d-video`. This overrides `--d-fusion`
+and skips the video projection similarity/norm penalties. It works with every
+fusion variant; the default keeps the learned video projection.
+
+For `--text-fusion frame`, `--vcross-weight W` sets the fixed scalar in
+`text_ln(hv0 + W * vcross)` before the text FFN and token head. The default is
+`1.0`; `0.0` makes token predictions depend only on video. For example:
+
+```bash
+python3 train.py --manifest data/train.jsonl \
+  --text-fusion frame --no-vproj --vcross-weight 0.25 \
+  --output checkpoints/frame-direct-video.pt
+```
+
+Confidence training uses token distributions with the same weight. The
+confidence branch itself still attends to the causal text history. Both options
+also work through `train_downvid.py`; `run_all_variants.py` applies `--no-vproj`
+to all variants and routes `--vcross-weight` only to variant 5.
+
+Checkpoints store both settings, and inference/resume restore them automatically.
+Older checkpoints retain projection and weight `1.0`. Removing projection from
+an existing projected checkpoint requires a fresh training run. When resuming,
+omit these options or supply matching settings; an explicit different
+`--vcross-weight` is rejected.
+
+### Window phasing for frame targets
+
+Use `--window-phasing 0.1` with `--text-fusion frame` (variant 5) to also supervise
+the previous window's token during the first 10% of each new token window,
+rounded down. The fraction must be in `[0,1]`; the default `0` disables phasing.
+
+For a window of `L` frames, the last phased zero-based offset is
+`floor(window_phasing * L) - 1`. A 20-frame window with `0.1` therefore phases
+offsets 0 and 1; a window shorter than 10 frames has no phased frames.
+Each phased frame contributes `0.5 * CE(current) + 0.5 * CE(previous)`.
+The batch loss still averages over valid frames, so a phased frame counts once.
+Repeated consecutive token IDs have the same loss as a single target.
+
+The first token window has no previous target. Gaps and padding remain ignored.
+Phasing uses the full original token window, including across `--max-frames`
+boundaries; it never restarts at a section cut. Teacher-token availability and
+confidence windows retain their existing boundaries. Evaluation CSVs continue
+to score the current token, making them comparable across phasing settings.
+
+```bash
+python3 tests/train_5_frame_tokens.py --manifest data/train.jsonl --window-phasing 0.1
+```
+
+The flag also works in `train_downvid.py`; `run_all_variants.py` routes it only
+to variant 5. The checkpoint records it in `training_args`. As with other loss
+hyperparameters, pass the desired value again when resuming training.
 
 ## Download videos and train
 

@@ -120,6 +120,8 @@ class AllVariantRunnerTests(unittest.TestCase):
             ["-N", "1", "--variant-args", "4:--pretrained-lm other"],
             ["-N", "1", "--variant-args", "5:--lambda-tcross 1"],
             ["-N", "1", "--variant-args", "1:--text-fusion frame"],
+            ["-N", "1", "--variant-args", "1:--vcross-weight 0.25"],
+            ["-N", "1", "--vcross-weight", "nan"],
             ["-N", "1", "--epochs", "0"],
             ["-N", "1", "--lr", "nan"],
             ["-N", "1", "--batch-size", "0"],
@@ -127,6 +129,13 @@ class AllVariantRunnerTests(unittest.TestCase):
         ):
             with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.plan(flags)
+
+    def test_projection_and_frame_weight_route_to_compatible_variants(self):
+        _, _, _, stages = self.plan(['-N', '1', '--no-vproj', '--vcross-weight', '0.25'])
+        for index, stage in enumerate(stages[1::2], 1):
+            args = runner.VARIANTS[index - 1].build_argparser().parse_args(stage['command'][2:])
+            self.assertTrue(args.no_vproj)
+            self.assertEqual(args.vcross_weight, .25 if index == 5 else None)
 
     def test_snapshot_preserves_order_duplicates_windows_and_absolute_paths(self):
         (self.root / "clip.avi").write_bytes(b"fixture")

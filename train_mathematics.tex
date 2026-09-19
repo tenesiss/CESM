@@ -324,7 +324,9 @@ h_f^{\mathrm{fr}}&=\LN_t(\bar v_f+d_f),\\
 \ell_f^{\mathrm{fr}}&=W_y\widehat h_f^{\mathrm{fr}}+b_y,
 \qquad p_f^{\mathrm{fr}}=\softmax(\ell_f^{\mathrm{fr}}).
 \end{align}
-For $f\in\mathcal W_i$, the supervised frame label is $y_i$.
+For $f\in\mathcal W_i$, the current frame label is $y_i$.
+Optional window phasing also supervises $y_{i-1}$ near the start of
+the window, as defined in Section~\ref{sec:window-phasing}.
 Frames in gaps have no supervised label. No frame is assigned an
 $\EOS$ target.
 
@@ -364,10 +366,11 @@ $\EOS$ queries at true video ends. Token-query prediction minimizes
  \sum_{(b,i)\in\mathcal I}\log p_{bi}(y_{bi}).
 \label{eq:token-ce}
 \end{equation}
-For frame prediction, let
-$\mathcal J=\{(b,f):f\in\bigcup_{i=1}^{N_b}\mathcal W_{bi}\}$ and
-let $y_{b,f}^{\mathrm{fr}}$ be the unique token whose window contains
-$f$. The loss becomes
+For frame prediction, let $\mathcal J$ contain all batch/frame pairs
+lying in a real-token window, including every nonempty intersection
+with a video section (Section~\ref{sec:sections}). Let
+$y_{b,f}^{\mathrm{fr}}$ be the unique token whose window contains
+$f$. With window phasing disabled, the loss becomes
 \begin{equation}
 \mathcal L_{\mathrm{pred}}
 =-\frac{1}{|\mathcal J|}
@@ -376,6 +379,71 @@ $f$. The loss becomes
 \end{equation}
 Thus a longer real-token window contributes more supervised positions
 in the frame variant.
+
+\subsection{Relative window phasing}
+\label{sec:window-phasing}
+
+Window phasing allows the previous token to remain a supervision target
+over an initial portion of the current token's window. It applies only
+to frame prediction. Let $\varphi\in[0,1]$ be the relative phasing
+fraction, configured by \texttt{--window-phasing}; its default is zero.
+Using the original, unclipped alignment window, define
+\begin{equation}
+L_{bi}=e_{bi}-a_{bi}+1,\qquad
+k_{bi}=\lfloor\varphi L_{bi}\rfloor,\qquad
+d_{bi}=k_{bi}-1.
+\label{eq:phase-length}
+\end{equation}
+Here $k_{bi}$ is the number of phased frames and $d_{bi}$ is the last
+included zero-based offset, not a frame count. The phased subset is
+\begin{equation}
+\mathcal P_{bi}=
+\begin{cases}
+\{a_{bi}+t: t\in\mathbb Z,\ 0\leq t\leq d_{bi}\},&i>1,\ k_{bi}>0,\\
+\varnothing,&\text{otherwise}.
+\end{cases}
+\label{eq:phase-subset}
+\end{equation}
+The index $i$ refers to the original token sequence, so the first token
+has no previous-token target; $\BOS$ is never added as a phased label.
+For example, $\varphi=0.1$ and $L_{bi}=20$ phase offsets $0$ and $1$.
+At this fraction a window shorter than ten frames has no phased frames.
+
+For $f\in\mathcal W_{bi}$, the per-frame cross entropy is
+\begin{equation}
+\mathcal C_{bif}^{(\varphi)}=
+\begin{cases}
+-\tfrac12\log p_{bf}^{\mathrm{fr}}(y_{bi})
+-\tfrac12\log p_{bf}^{\mathrm{fr}}(y_{b,i-1}),&f\in\mathcal P_{bi},\\
+-\log p_{bf}^{\mathrm{fr}}(y_{bi}),&f\notin\mathcal P_{bi}.
+\end{cases}
+\label{eq:phased-frame-ce}
+\end{equation}
+This is cross entropy against a target assigning equal probability to
+the current and previous tokens on phased frames. If those token IDs
+are equal, their weights combine to one and the loss is ordinary
+single-target cross entropy.
+
+Let $i(b,f)$ identify the original token window containing a valid
+frame. The first-stage prediction objective becomes
+\begin{equation}
+\mathcal L_{\mathrm{pred}}
+=\frac{1}{|\mathcal J|}\sum_{(b,f)\in\mathcal J}
+ \mathcal C_{b,i(b,f),f}^{(\varphi)},\qquad
+|\mathcal J|=\sum_b|\{f:(b,f)\in\mathcal J\}|.
+\label{eq:phased-batch-ce}
+\end{equation}
+Each valid frame counts once in the batch mean, including a phased
+frame with two targets. Gaps and padding contribute neither loss nor
+denominator mass. At $\varphi=0$, this reduces to
+\eqref{eq:frame-ce}; at $\varphi=1$, every frame of each window after
+the first uses both labels. Token-query objectives are unaffected.
+
+Phasing changes supervision without shifting alignment boundaries or
+teacher-token availability in \eqref{eq:v2t}. Stage~II retains the same
+confidence windows and target construction, using the predictor learned
+with the chosen phasing fraction. Evaluation continues to score the
+current token $y_{bi}$ at each labeled frame.
 
 \subsection{Projection geometry and norms}
 
@@ -473,6 +541,8 @@ other regularization coefficients equal to zero. The frame variant
 requires $\lambda_{\mathrm{mono}}=\lambda_{\mathrm{align}}
 =\lambda_{\mathrm{cross}}=0$, since it has no text-to-video branch.
 Confidence-only transformations do not enter this objective.
+When frame window phasing is enabled, $\mathcal L_{\mathrm{pred}}$ in
+\eqref{eq:stage-one} is given by \eqref{eq:phased-batch-ce}.
 
 \section{Stage II: confidence from a frozen predictor}
 
@@ -678,6 +748,19 @@ including a token that finishes in a later section. Confidence uses
 the clipped assigned windows for token-query variants, and all
 nonempty window intersections for the frame variant. Its future
 offsets terminate at the end of that local window.
+
+Window phasing is computed before clipping. In section-local coordinates,
+the phased subset is
+\begin{equation}
+\mathcal P'_{i,[r,s)}
+=\{f-r:f\in\mathcal P_i\cap[r,s)\}.
+\label{eq:section-phasing}
+\end{equation}
+Thus $k_i=\lfloor\varphi(e_i-a_i+1)\rfloor$ always uses the full
+original window length, and the previous label remains the original
+$y_{i-1}$ even if its window lies in an earlier section. Phasing never
+restarts at a section boundary. If a cut falls inside the phased subset,
+only its remaining frames retain the additional target.
 
 The full preceding text prefix is retained, but visual temporal
 context and visual positions begin anew in each section. The mouth

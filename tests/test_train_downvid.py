@@ -49,7 +49,8 @@ class PipelineTests(PipelineFixture):
                          "--js-runtimes", "node:/runtime path/node",
                          "--epochs", "2", "--device", "cpu", "--confidence-epochs", "3",
                          "--pretrained-lm", "a/model with spaces", "--fine-tune-pretrained-lm",
-                         "--output", "a path/checkpoint.pt", "--lambda-align", "0.2")
+                         "--output", "a path/checkpoint.pt", "--lambda-align", "0.2",
+                         "--no-vproj", "--vcross-weight", "0.25")
         parsed = train.build_argparser().parse_args(pipeline.training_command(args)[2:])
         expected = {key: getattr(args, key) for key in vars(parsed)}
         expected["manifest"] = str(args.manifest)
@@ -171,7 +172,7 @@ class PipelineTests(PipelineFixture):
                         contextlib.redirect_stdout(io.StringIO()):
                     if valid:
                         pipeline.validate_download_runtimes(args)
-                        self.assertEqual(args.js_runtimes, [f"{runtime}:/runtime/{runtime}"])
+                        self.assertEqual(args.js_runtimes, [f"{runtime}:{Path('/runtime') / runtime}"])
                     else:
                         with self.assertRaisesRegex(pipeline.DownloadSetupError, version.removeprefix("v")):
                             pipeline.validate_download_runtimes(args)
@@ -184,7 +185,7 @@ class PipelineTests(PipelineFixture):
         with patch.object(pipeline.subprocess, "run", side_effect=results), \
                 contextlib.redirect_stdout(io.StringIO()):
             pipeline.validate_download_runtimes(args)
-        self.assertEqual(args.js_runtimes, ["deno:/runtime/deno"])
+        self.assertEqual(args.js_runtimes, [f"deno:{Path('/runtime/deno')}"])
         with patch.object(pipeline.shutil, "which", return_value=None):
             with self.assertRaisesRegex(pipeline.DownloadSetupError, "none on PATH"):
                 pipeline.validate_download_runtimes(self.args())
