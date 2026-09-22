@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare one video dataset, then train and evaluate each variant on the same samples.
+"""Prepare one video dataset, then train and evaluate selected variants on the same samples.
 
 Use -N with --dataset talkvid/hdtf, or --manifest to reuse a prepared dataset. Training
-options apply to all compatible variants; --variant-args provides per-variant
+options apply to all compatible selected variants; --variants selects which to run
+(default: all five), and --variant-args provides per-variant
 overrides. Each stage runs in its own process to release model/GPU memory.
 """
 
@@ -32,8 +33,8 @@ ROOT = Path(__file__).resolve().parent
 VARIANTS = (train_1_as_is, train_2_tcross_loss, train_3_no_ht0,
             train_4_weighted_ht0, train_5_frame_tokens)
 MANAGED = {"help", "manifest", "output", "resume", "confidence_only",
-           "text_fusion", "variant_name", "metrics_csv"}
-DOWNLOAD_ONLY = {"num_videos", "prepare_only", "login", "logout"}
+           "text_fusion", "variant_name", "metrics_csv", "validation_manifest"}
+DOWNLOAD_ONLY = {"num_videos", "prepare_only", "login", "logout", "exclude_manifest"}
 SPECIFIC = {"lambda_tcross": {2}, "tcross_margin": {2}, "w_t": {4},
             "vcross_weight": {5}, "window_phasing": {5},
             "lambda_mono": {1, 2, 3, 4}, "lambda_align": {1, 2, 3, 4},
@@ -68,8 +69,16 @@ def build_argparser():
                         help="Download and align exactly N usable videos/clips once")
     source.add_argument("--manifest", type=Path,
                         help="Reuse these exact samples instead of downloading")
+    validation = parser.add_mutually_exclusive_group()
+    validation.add_argument("--N-valid", dest="num_valid", type=train_downvid.positive_int,
+                            help="Download this many separate validation videos/clips; enables early stopping")
+    validation.add_argument("--validation-manifest", type=Path,
+                            help="Reuse a separate validation JSONL instead of downloading validation videos")
     parser.add_argument("--run-dir", type=Path,
                         help="New output directory (default: runs/variants_TIMESTAMP beside this script)")
+    parser.add_argument("--variants", type=int, nargs="+", choices=range(1, len(VARIANTS) + 1),
+                        default=list(range(1, len(VARIANTS) + 1)), metavar="N",
+                        help="Variants to train and evaluate, e.g. --variants 1 3 5 (default: 1 2 3 4 5); run once each in numeric order")
     parser.add_argument("--variant-args", action="append", default=[], metavar="N:FLAGS",
                         help="Per-variant overrides, e.g. '4:--lr 1e-4 --batch-size 4'; repeatable")
     parser.add_argument("--eval-batch-size", type=train_downvid.positive_int, default=None,
@@ -129,6 +138,10 @@ def variant_overrides(parser, specifications):
 
 
 def validate_training_args(parser, args):
+    try:
+        train.validate_early_stopping_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.epochs <= 0 or args.confidence_epochs < 0:
         parser.error("Each variant requires --epochs > 0 and --confidence-epochs >= 0")
     if args.batch_size <= 0 or args.workers < 0:
@@ -156,20 +169,37 @@ def build_commands(parser, args, run_dir):
     """Build and validate every training command before downloading anything."""
     actions = training_actions()
     overrides = variant_overrides(parser, args.variant_args)
+    selected = set(args.variants)
+    for specification in args.variant_args:
+        index = int(specification.partition(":")[0])
+        if index not in selected:
+            parser.error(f"--variant-args targets variant {index}, which is not selected by --variants")
     snapshot = run_dir / "samples.jsonl"
     stages = []
     prepared = args.manifest.expanduser().resolve() if args.manifest else run_dir / f"{args.dataset}.jsonl"
-    if args.num_videos is not None:
+    def download_command(count, manifest):
         command = [sys.executable, str(ROOT / "train_downvid.py"), "--prepare-only",
-                   f"--num-videos={args.num_videos}", f"--manifest={prepared}"]
+                   f"--num-videos={count}", f"--manifest={manifest}"]
         for action in train_downvid.build_argparser()._actions:
             if action.dest in MANAGED | DOWNLOAD_ONLY:
                 continue
             if action.dest not in actions or action.dest in ("pretrained_lm", "pretrained_lm_local_files_only"):
                 command.extend(option_tokens(action, getattr(args, action.dest, None)))
+        return command
+    if args.num_videos is not None:
+        command = download_command(args.num_videos, prepared)
+        if args.validation_manifest is not None:
+            command.append(f"--exclude-manifest={run_dir / 'validation_samples.jsonl'}")
         stages.append({"name": "download", "command": command})
+    if args.num_valid is not None:
+        validation_prepared = run_dir / f"validation_{args.dataset}.jsonl"
+        command = download_command(args.num_valid, validation_prepared)
+        command.append(f"--exclude-manifest={snapshot}")
+        stages.append({"name": "download_validation", "command": command})
     checkpoints = []
     for index, module in enumerate(VARIANTS, 1):
+        if index not in selected:
+            continue
         checkpoint = run_dir / "checkpoints" / Path(module.DEFAULTS["output"]).name
         checkpoints.append(checkpoint)
         values = {dest: getattr(args, dest) for dest in actions
@@ -180,6 +210,8 @@ def build_commands(parser, args, run_dir):
         # Evaluate the saved checkpoint in a separate process immediately after training.
         flags += [f"--manifest={snapshot}", f"--output={checkpoint}", "--metrics-csv=",
                   f"--variant-name={module.DEFAULTS['variant_name']}"]
+        if args.num_valid is not None or args.validation_manifest is not None:
+            flags.append(f"--validation-manifest={run_dir / 'validation_samples.jsonl'}")
         parsed = module.build_argparser().parse_args(flags)
         validate_training_args(parser, parsed)
         stages.append({"name": f"train_{index}", "command": [sys.executable, module.__file__, *flags]})
@@ -195,6 +227,13 @@ def build_commands(parser, args, run_dir):
         # Each checkpoint supplies its own preprocessing and max_frames, including
         # per-variant overrides. The same sample manifest is always used.
         stages.append({"name": f"evaluate_{index}", "command": command, "csv": str(metrics_csv)})
+        if args.num_valid is not None or args.validation_manifest is not None:
+            validation_csv = checkpoint.with_suffix(".validation.metrics.csv")
+            validation_command = command.copy()
+            validation_command[validation_command.index("--manifest") + 1] = str(run_dir / "validation_samples.jsonl")
+            validation_command[validation_command.index("--output") + 1] = str(validation_csv)
+            stages.append({"name": f"evaluate_validation_{index}", "command": validation_command,
+                           "csv": str(validation_csv), "split": "validation"})
     return prepared, snapshot, checkpoints, stages
 
 
@@ -268,17 +307,34 @@ def main(argv=None):
     (run_dir / "logs").mkdir()
     report_path = run_dir / "run.json"
     report = {"status": "running", "source": str(prepared), "samples": None,
+              "variants": sorted(set(args.variants)),
               "checkpoints": list(map(str, checkpoints)), "csv": str(run_dir / "all_variants.csv"),
               "stages": [dict(stage, status="pending") for stage in stages]}
+    validation_prepared = None
+    if args.num_valid is not None or args.validation_manifest is not None:
+        validation_prepared = (args.validation_manifest.expanduser().resolve() if args.validation_manifest
+                               else run_dir / f"validation_{args.dataset}.jsonl")
+        report.update(validation_source=str(validation_prepared), validation_samples=None,
+                      validation_csv=str(run_dir / "all_variants.validation.csv"))
     train_downvid.write_json(report_path, report)
     print(f"Run directory: {run_dir}", flush=True)
     try:
         completed_csvs = []
+        completed_validation_csvs = []
         if args.manifest:
             report["samples"] = snapshot_samples(prepared, snapshot)
+        if args.validation_manifest:
+            report["validation_samples"] = snapshot_samples(validation_prepared, run_dir / "validation_samples.jsonl")
+        def verify_splits():
+            for split in ("samples", "validation_samples"):
+                if report.get(split) is not None:
+                    verify_snapshot(report[split])
+            if report["samples"] is not None and report.get("validation_samples") is not None:
+                train.validate_validation_split(train.load_manifest(snapshot),
+                                                train.load_manifest(report["validation_samples"]["manifest"]))
+        verify_splits()
         for stage in report["stages"]:
-            if report["samples"] is not None:
-                verify_snapshot(report["samples"])
+            verify_splits()
             stage["status"] = "running"
             stage["log"] = str(run_dir / "logs" / f"{stage['name']}.log")
             train_downvid.write_json(report_path, report)
@@ -286,13 +342,20 @@ def main(argv=None):
             run_stage(stage["command"], Path(stage["log"]))
             if stage["name"] == "download":
                 report["samples"] = snapshot_samples(prepared, snapshot, args.num_videos)
+            if stage["name"] == "download_validation":
+                report["validation_samples"] = snapshot_samples(validation_prepared,
+                                                                run_dir / "validation_samples.jsonl", args.num_valid)
+            verify_splits()
             if "csv" in stage:
-                combine_metrics_csv([*completed_csvs, stage["csv"]], report["csv"])
-                completed_csvs.append(stage["csv"])
-                print(f"Updated combined CSV: {report['csv']} ({len(completed_csvs)}/5 variants)", flush=True)
+                validation_stage = stage.get("split") == "validation"
+                completed = completed_validation_csvs if validation_stage else completed_csvs
+                output_csv = report["validation_csv"] if validation_stage else report["csv"]
+                combine_metrics_csv([*completed, stage["csv"]], output_csv)
+                completed.append(stage["csv"])
+                print(f"Updated combined CSV: {output_csv} ({len(completed)}/{len(checkpoints)} variants)", flush=True)
             stage["status"] = "complete"
             train_downvid.write_json(report_path, report)
-        verify_snapshot(report["samples"])
+        verify_splits()
         report["status"] = "complete"
         train_downvid.write_json(report_path, report)
     except BaseException as exc:
@@ -303,8 +366,10 @@ def main(argv=None):
         report["error"] = str(exc)
         train_downvid.write_json(report_path, report)
         raise
-    print(f"\nCompleted all five variants on {report['samples']['count']} samples.", flush=True)
+    print(f"\nCompleted {len(checkpoints)} selected variant(s) on {report['samples']['count']} samples.", flush=True)
     print(f"Combined CSV: {report['csv']}", flush=True)
+    if "validation_csv" in report:
+        print(f"Validation CSV: {report['validation_csv']}", flush=True)
     return report
 
 

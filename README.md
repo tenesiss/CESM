@@ -211,10 +211,6 @@ probability margin. The
 [experiment guide](tests/README.md#per-sample-csv-after-training) also describes
 combining checkpoint results into one CSV without retraining.
 
-The runner's evaluation stage and the standalone evaluation command require
-`tests/evaluate_checkpoints.py`, which is not present in this checkout. Individual
-variant scripts can still write their per-sample CSVs through the shared trainer.
-
 To download TalkVid once, train all five variants, and evaluate their checkpoints
 on those exact downloaded samples, use [`run_all_variants.py`](run_all_variants.py):
 
@@ -224,6 +220,31 @@ python3 run_all_variants.py -N 20 --dataset-language English \
   --run-dir runs/talkvid_comparison --max-frames 256 \
   --batch-size 2 --lr 3e-4 --epochs 50 --w-t 0.5
 ```
+
+Add `--variants 1 3 5` to train and generate metrics only for those variants,
+or `--variants 4` for a single variant. Omit the option to run all five.
+Selected variants run once each in numeric order; `all_variants.csv` contains
+only their results.
+
+Add `--N-valid 5` to download five additional validation videos/clips and enable
+validation early stopping:
+
+```bash
+python3 run_all_variants.py -N 20 --N-valid 5 --variants 1 3 5 \
+  --run-dir runs/validated_comparison --epochs 50 --confidence-epochs 10 \
+  --early-stopping-patience 5 --early-stopping-min-delta 0.001
+```
+
+Each stage stops after five epochs without sufficient validation-loss improvement
+and restores the checkpoint with the lowest `(training_loss + validation_loss) / 2`.
+Both losses are measured on the same end-of-epoch weights with dropout disabled.
+The best prediction checkpoint is restored before confidence training, which gets
+its own stopping counter and best checkpoint. Training and validation metrics are
+generated from the restored final model, in `all_variants.csv` and
+`all_variants.validation.csv` respectively. Use `--validation-manifest PATH` to
+reuse a separate validation dataset, or `--early-stopping-patience 0` to run all
+epochs while still restoring the best checkpoint. Without a validation dataset,
+training keeps its previous fixed-epoch behavior.
 
 FFmpeg (`ffmpeg` and `ffprobe`) and a supported yt-dlp JavaScript runtime must be
 available as described in [dataset setup](#download-videos-and-train). Each variant

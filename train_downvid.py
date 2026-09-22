@@ -75,6 +75,8 @@ def build_argparser():
                        help="Filter info.Language, e.g. English or Spanish; repeatable")
     group.add_argument("--start-index", type=int, default=0,
                        help="Skip N metadata rows or HDTF videos in filename order (default: 0)")
+    group.add_argument("--exclude-manifest", type=Path,
+                       help="Exclude local videos and known source uploads from this JSONL (for validation downloads)")
     group.add_argument("--max-attempts", type=positive_int,
                        help="Maximum eligible, distinct clips to try; remaining clips from an "
                             "unavailable upload are skipped without attempts (default: 10 * N)")
@@ -761,9 +763,11 @@ def prepare(args):
     report = {"dataset": args.dataset, "metadata": source, "requested": args.num_videos,
               "download_max_frames": args.download_max_frames,
               "manifest": str(args.manifest), "results": [], "failures": [],
-              "unavailable_sources": {}, "skipped_unavailable_clips": 0}
+              "unavailable_sources": {}, "skipped_unavailable_clips": 0,
+              "skipped_excluded_clips": 0}
     report_path = args.work_dir / "run_report.json"
     records, seen = [], set()
+    excluded = train.video_identity_keys(train.load_manifest(args.exclude_manifest)) if args.exclude_manifest else set()
     attempts = 0
     whisper = None
     languages = {value.casefold() for value in args.dataset_language}
@@ -792,6 +796,11 @@ def prepare(args):
                 if clip.key in seen:
                     continue
                 seen.add(clip.key)
+                candidate_keys = {("source", clip.source_key),
+                                  ("path", str((download_folder(clip, args) / "video.mp4").resolve()))}
+                if candidate_keys & excluded:
+                    report["skipped_excluded_clips"] += 1
+                    continue
                 if (clip.source_key in report["unavailable_sources"] and
                         cached_download(clip, args) is None):
                     report["skipped_unavailable_clips"] += 1
@@ -836,6 +845,7 @@ def prepare(args):
                             jpeg_quality=args.jpeg_quality, whisper_instance=whisper,
                         )
                     record = training_record(manifest, tokenizer, unit, video)
+                    record["source_key"] = clip.source_key
                     grouper.write_jsonl([record], output / "data.jsonl")
                     write_json(completed, {"video_signature": signature, "config": config})
                     jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")

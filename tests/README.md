@@ -92,7 +92,7 @@ manifest and output paths resolve from the current working directory.
 ## All-in-one download, train and evaluate
 
 From the repository root, run `run_all_variants.py` to download and align TalkVid or HDTF
-**once**, then train and evaluate variants 1–5 sequentially on **the exact same
+**once**, then train and evaluate the selected variants (1–5 by default) sequentially on **the exact same
 manifest samples**. Each variant's CSV is saved before the next variant starts:
 
 ```bash
@@ -135,13 +135,86 @@ python3 run_all_variants.py \
   --epochs 10 --batch-size 2 --max-frames 128 --w-t 0.5
 ```
 
+To train and generate metrics for a subset, add `--variants` followed by one or
+more variant numbers:
+
+```bash
+python3 run_all_variants.py --manifest data/talkvid/data.jsonl \
+  --variants 1 3 5 --run-dir runs/selected_variants --epochs 10
+```
+
+Use `--variants 4` for a single variant. The default is all five. Selected variants
+run once each in numeric order, even if numbers are repeated or supplied out of
+order. Only selected variants get checkpoints, evaluation CSVs, and training/evaluation
+logs; `all_variants.csv` combines only their results. `--variant-args` must target
+a selected variant; otherwise the runner fails before downloading or training.
+
+### Validation, early stopping, and checkpoint selection
+
+`-N` remains the number of training clips. Add `--N-valid` to download a separate
+validation set once, shared by every selected variant:
+
+```bash
+python3 run_all_variants.py --dataset hdtf -N 100 --N-valid 20 \
+  --variants 1 4 5 --run-dir runs/hdtf_validation \
+  --epochs 50 --confidence-epochs 10 --early-stopping-patience 5 \
+  --early-stopping-min-delta 0.001
+```
+
+Validation preparation excludes training video paths and known source uploads,
+so other TalkVid clips from a training upload are also excluded. Newly generated
+manifests record `source_key` for this purpose. Legacy/custom manifests without
+source information can only be checked by resolved video path; use separate
+source videos when preparing them. Failed candidates do not cause the sets to
+overlap. Both requested counts must be fully prepared before training starts.
+
+To reuse existing datasets, pass `--manifest training.jsonl --validation-manifest
+validation.jsonl`. You can also combine `--manifest` with `--N-valid`, or `-N`
+with `--validation-manifest`. `--N-valid` and `--validation-manifest` are mutually
+exclusive. Snapshots are saved as `samples.jsonl` and `validation_samples.jsonl`;
+their hashes and counts are recorded in `run.json`. Overlapping splits are rejected.
+
+After each epoch, the trainer evaluates the **same current weights** on both
+datasets with dropout disabled and no gradient updates. The prediction stage uses
+its total training objective, including enabled regularizers and window phasing;
+the confidence stage uses its confidence objective. Each dataset's batch losses
+are weighted by its number of supervised positions (tokens, frames, or confidence
+timesteps). The two resulting dataset means have equal weight in checkpoint
+selection, regardless of dataset sizes:
+
+```text
+checkpoint score = (training_loss + validation_loss) / 2
+```
+
+The checkpoint with the strictly lowest score is kept; ties keep the earlier
+checkpoint. This is a combined criterion: the minimum training loss and minimum
+validation loss may occur at different epochs. Early stopping separately watches
+validation loss. `--early-stopping-patience` defaults to **5** epochs without an
+improvement larger than `--early-stopping-min-delta` (default **0**). A patience
+of **0** disables stopping while retaining best-checkpoint selection. These
+settings also work in `--variant-args` and in the individual training scripts.
+
+The best prediction weights are restored before confidence training. Confidence
+training freezes that prediction path and selects its own best checkpoint with a
+fresh patience counter. The best weights are restored even when the epoch limit
+is reached. Loss evaluation adds a full training-set and validation-set pass per
+epoch. Without a validation manifest, the existing fixed-epoch training is unchanged.
+
+Each final checkpoint records `validation_selection` with the best epoch, training
+loss, validation loss, combined score, full epoch history, and stopping status for
+each trained stage. Logs print the same losses and restored epoch numbers.
+Final evaluation uses the restored model. Training metrics retain their existing
+paths; validation metrics go to `CHECKPOINT_STEM.validation.metrics.csv` and
+`RUN_DIR/all_variants.validation.csv`. These NLL/margin CSVs use the metric
+definitions below, which differ from the total objective used for checkpoint selection.
+
 Choose either `-N` or `--manifest`. `--work-dir` controls the reusable dataset
 cache (default: `data/talkvid` or `data/hdtf`); `--run-dir` holds this experiment's outputs and must be empty or new.
 If omitted, a new timestamped directory under `runs/` is used. Paths passed on
 the CLI resolve from the current directory, so invoking the runner by its
 absolute path from elsewhere also works.
 
-The runner creates:
+With all five variants selected, the runner creates:
 
 ```text
 RUN_DIR/
@@ -155,7 +228,7 @@ RUN_DIR/
   checkpoints/test_1_as_is.metrics.csv  # One CSV beside each completed checkpoint
   ...
   all_variants.csv                 # Updated after each variant; five rows per sample when complete
-  run.json                        # Manifest SHA-256, stage status, commands and output paths
+  run.json                        # Selected variants, manifest SHA-256, stage status, commands and output paths
   logs/download.log               # Download mode only
   logs/train_1.log ... train_5.log
   logs/evaluate_1.log ... evaluate_5.log
@@ -208,7 +281,8 @@ otherwise evaluation uses the shared batch size/device (or `2`/`auto`).
 The combined CSV has the per-sample NLL and probability-margin columns described
 below: token averages for variants 1–4, labeled-frame averages for variant 5.
 These are measurements on the downloaded **training samples**. For N samples,
-the completed CSV contains 5 × N data rows, even when videos are split into sections.
+the completed CSV contains K × N data rows for K selected variants (5 × N by default),
+even when videos are split into sections.
 During the run, it contains N rows per successfully evaluated variant.
 If a stage fails, later stages do not run; completed checkpoints, per-variant CSVs,
 the combined CSV, logs and stage status remain available. Once all checkpoints exist, the standalone

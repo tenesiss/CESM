@@ -54,7 +54,7 @@ import math
 import os
 import random
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -529,6 +529,18 @@ def load_manifest(path: str) -> List[dict]:
     if not rows:
         raise ValueError(f"Manifest is empty: {path}")
     return rows
+
+
+def video_identity_keys(rows: Sequence[dict]) -> set:
+    """Match local videos and, when recorded, their original source uploads."""
+    keys = {("path", str(Path(row["video"]).resolve())) for row in rows}
+    keys.update(("source", row["source_key"]) for row in rows if row.get("source_key"))
+    return keys
+
+
+def validate_validation_split(training_rows, validation_rows) -> None:
+    if video_identity_keys(training_rows) & video_identity_keys(validation_rows):
+        raise ValueError("Training and validation manifests overlap: use separate videos/source uploads")
 
 
 def repair_quantized_empty_windows(
@@ -2658,6 +2670,7 @@ def save_checkpoint(
     stage: str = "token",
     confidence_epoch: int = 0,
     confidence_trained: bool = False,
+    validation_selection: Optional[dict] = None,
 ) -> None:
     ckpt = {
         "model_state": model.state_dict(),
@@ -2692,8 +2705,100 @@ def save_checkpoint(
             "tau_conf": float(args.confidence_temperature),
         },
     }
+    if validation_selection:
+        ckpt["validation_selection"] = validation_selection
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, path)
+
+
+def validate_early_stopping_args(args) -> None:
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience must be >= 0 (0 disables stopping)")
+    if not math.isfinite(args.early_stopping_min_delta) or args.early_stopping_min_delta < 0:
+        raise ValueError("--early-stopping-min-delta must be finite and >= 0")
+
+
+@dataclass
+class ValidationMonitor:
+    """Stop on validation plateaus; select the exact minimum joint loss separately."""
+
+    patience: int
+    min_delta: float
+    best_score: float = math.inf
+    best_validation_loss: float = math.inf
+    bad_epochs: int = 0
+    best: Optional[dict] = None
+    history: List[dict] = field(default_factory=list)
+
+    def update(self, epoch, training_loss, validation_loss) -> bool:
+        if not all(math.isfinite(value) for value in (training_loss, validation_loss)):
+            raise ValueError("Non-finite training/validation loss; refusing to select this checkpoint")
+        score = training_loss / 2 + validation_loss / 2
+        record = {"epoch": epoch, "training_loss": training_loss,
+                  "validation_loss": validation_loss, "score": score}
+        self.history.append(record)
+        improved = score < self.best_score
+        if improved:
+            self.best_score, self.best = score, record
+        if validation_loss < self.best_validation_loss - self.min_delta:
+            self.best_validation_loss = validation_loss
+            self.bad_epochs = 0
+        else:
+            self.bad_epochs += 1
+        return improved
+
+    @property
+    def should_stop(self):
+        return self.patience > 0 and self.bad_epochs >= self.patience
+
+    def state_dict(self):
+        return {"criterion": "mean_training_validation_loss", "best": self.best,
+                "history": self.history, "patience": self.patience,
+                "min_delta": self.min_delta, "stopped_early": self.should_stop}
+
+
+@torch.no_grad()
+def evaluate_loss(model, loader, device, args, *, stage="token") -> float:
+    """Evaluate the same objective on fixed weights, weighted by supervised positions."""
+    modes = [(module, module.training) for module in model.modules()]
+    model.eval()
+    total, count = 0.0, 0
+    try:
+        for batch in loader:
+            if stage == "token":
+                targets = batch["frame_targets"] if model.cfg.text_fusion == "frame" else batch["targets"]
+                weight = int((targets != args.pad_id).sum())
+                if not weight:
+                    continue
+            else:
+                counts = batch["frame_window_counts"] if model.cfg.text_fusion == "frame" else batch_window_counts(batch)
+                if not (counts > 0).any():
+                    continue
+            with torch.amp.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
+                batch = move_batch(batch, device)
+                if stage == "token":
+                    out = model(batch, flash_mono=args.flash_mono,
+                                need_attention=bool(args.lambda_mono or args.lambda_align))
+                    loss = compute_losses(model, batch, out, args)["total"]
+                    del out
+                else:
+                    loss, stats = document_confidence_loss(model, batch, args)
+                    weight = int(stats["valid"].sum())
+                    del stats
+            total += float(loss) * weight
+            count += weight
+            del loss, batch
+    finally:
+        for module, mode in modes:
+            module.training = mode
+    if not count:
+        raise ValueError(f"No supervised positions were available for {stage} loss evaluation")
+    return total / count
+
+
+def restore_checkpoint_weights(model, path):
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(saved["model_state"], strict=True)
 
 
 def _confidence_modules(model: UnnobaModel) -> List[nn.Module]:
@@ -2737,6 +2842,7 @@ def configure_token_stage(model: UnnobaModel) -> List[nn.Parameter]:
 
 
 def train(args) -> None:
+    validate_early_stopping_args(args)
     metrics_path = None
     if args.metrics_csv:
         metrics_path = str(Path(args.output).with_suffix(".metrics.csv")) if args.metrics_csv == "auto" else args.metrics_csv
@@ -2775,6 +2881,13 @@ def train(args) -> None:
 
     seed_everything(args.seed)
     rows = load_manifest(args.manifest)
+    validation_rows = load_manifest(args.validation_manifest) if args.validation_manifest else None
+    if validation_rows is not None:
+        validate_validation_split(rows, validation_rows)
+        if Path(args.output).resolve() == Path(args.validation_manifest).resolve():
+            raise ValueError("--output must differ from --validation-manifest")
+        if metrics_path and Path(metrics_path).resolve() == Path(args.validation_manifest).resolve():
+            raise ValueError("--metrics-csv must differ from --validation-manifest")
     resume_ckpt = None
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -2877,6 +2990,25 @@ def train(args) -> None:
         collate_fn=make_collate(tokenizer.pad_id),
         pin_memory=torch.cuda.is_available(),
     )
+    validation_selection = {}
+    token_monitor = confidence_monitor = None
+    if validation_rows is not None:
+        validation_ds = VideoTextWindowDataset(
+            validation_rows, tokenizer, cfg.mouth_size, use_face_detector=not args.no_face_detector,
+            max_frames=args.max_frames, video_dtype=ds.video_dtype,
+            window_phasing=args.window_phasing,
+        )
+        def loss_loader(dataset):
+            return DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
+                              num_workers=args.workers, collate_fn=make_collate(tokenizer.pad_id),
+                              pin_memory=device.type == "cuda",
+                              generator=torch.Generator().manual_seed(args.seed))
+        training_loss_loader = loss_loader(ds)
+        validation_loader = loss_loader(validation_ds)
+        token_monitor = ValidationMonitor(args.early_stopping_patience, args.early_stopping_min_delta)
+        confidence_monitor = ValidationMonitor(args.early_stopping_patience, args.early_stopping_min_delta)
+        print(f"validation videos={len(validation_rows)}; select lowest (training_loss + validation_loss) / 2; "
+              f"validation patience={args.early_stopping_patience}")
 
     model = UnnobaModel(
         cfg,
@@ -2893,6 +3025,10 @@ def train(args) -> None:
         start_epoch = int(resume_ckpt.get("epoch", 0) or 0)
         prior_confidence_epoch = int(resume_ckpt.get("confidence_epoch", 0) or 0)
         confidence_already_trained = bool(resume_ckpt.get("confidence", {}).get("trained", False))
+        if args.epochs == 0:
+            validation_selection.update(resume_ckpt.get("validation_selection", {}))
+            if args.confidence_epochs > 0:
+                validation_selection.pop("confidence", None)
         print(f"resumed {args.resume} token_epoch={start_epoch} confidence_epoch={prior_confidence_epoch}")
         # load_state_dict has copied every tensor into the model. Keeping the
         # CPU checkpoint mapping alive would retain a second full set of model
@@ -2989,12 +3125,27 @@ def train(args) -> None:
             print(f"token epoch={epoch} done {msg}")
             if n == 0:
                 raise ValueError("No supervised positions were available for token/frame training")
-            save_checkpoint(
-                args.output, model, tokenizer, args, epoch, stage="token",
-                confidence_epoch=prior_confidence_epoch,
-                confidence_trained=confidence_already_trained,
-            )
-            print(f"saved {args.output}")
+            improved = True
+            if token_monitor is not None:
+                out = losses = None
+                opt.zero_grad(set_to_none=True)
+                training_loss = evaluate_loss(model, training_loss_loader, device, args)
+                validation_loss = evaluate_loss(model, validation_loader, device, args)
+                improved = token_monitor.update(epoch, training_loss, validation_loss)
+                validation_selection["token"] = token_monitor.state_dict()
+                print(f"token epoch={epoch} training_loss={training_loss:.6f} "
+                      f"validation_loss={validation_loss:.6f} joint_loss={(training_loss + validation_loss) / 2:.6f}")
+            if improved:
+                save_checkpoint(
+                    args.output, model, tokenizer, args, epoch, stage="token",
+                    confidence_epoch=prior_confidence_epoch,
+                    confidence_trained=confidence_already_trained,
+                    validation_selection=validation_selection,
+                )
+                print(f"saved {args.output}")
+            if token_monitor is not None and token_monitor.should_stop:
+                print(f"Early stopping token training at epoch {epoch}: validation loss stopped improving")
+                break
     else:
         final_token_epoch = start_epoch
 
@@ -3007,6 +3158,12 @@ def train(args) -> None:
         del opt, scaler, token_params, out, losses, batch
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        if token_monitor is not None:
+            restore_checkpoint_weights(model, args.output)
+            final_token_epoch = token_monitor.best["epoch"]
+            save_checkpoint(args.output, model, tokenizer, args, final_token_epoch,
+                            validation_selection=validation_selection)
+            print(f"Restored best token checkpoint: epoch={final_token_epoch}")
 
     # ------------------------------------------------------------------
     # Stage 2: document confidence objective. Freeze every parameter that can
@@ -3063,12 +3220,35 @@ def train(args) -> None:
                 f"confidence epoch={conf_epoch} done "
                 f"loss={total_loss/max(1,n):.4f} mean_s={total_mean_target/max(1,n):.4f}"
             )
-            save_checkpoint(
-                args.output, model, tokenizer, args, final_token_epoch,
-                stage="confidence", confidence_epoch=conf_epoch,
-                confidence_trained=confidence_already_trained or n > 0,
-            )
-            print(f"saved {args.output}")
+            improved = True
+            if confidence_monitor is not None:
+                if n == 0:
+                    raise ValueError("No supervised positions were available for confidence training")
+                conf_loss = conf_stats = None
+                conf_opt.zero_grad(set_to_none=True)
+                training_loss = evaluate_loss(model, training_loss_loader, device, args, stage="confidence")
+                validation_loss = evaluate_loss(model, validation_loader, device, args, stage="confidence")
+                improved = confidence_monitor.update(conf_epoch, training_loss, validation_loss)
+                validation_selection["confidence"] = confidence_monitor.state_dict()
+                print(f"confidence epoch={conf_epoch} training_loss={training_loss:.6f} "
+                      f"validation_loss={validation_loss:.6f} joint_loss={(training_loss + validation_loss) / 2:.6f}")
+            if improved:
+                save_checkpoint(
+                    args.output, model, tokenizer, args, final_token_epoch,
+                    stage="confidence", confidence_epoch=conf_epoch,
+                    confidence_trained=confidence_already_trained or n > 0,
+                    validation_selection=validation_selection,
+                )
+                print(f"saved {args.output}")
+            if confidence_monitor is not None and confidence_monitor.should_stop:
+                print(f"Early stopping confidence training at epoch {conf_epoch}: validation loss stopped improving")
+                break
+        if confidence_monitor is not None:
+            restore_checkpoint_weights(model, args.output)
+            save_checkpoint(args.output, model, tokenizer, args, final_token_epoch,
+                            stage="confidence", confidence_epoch=confidence_monitor.best["epoch"],
+                            confidence_trained=True, validation_selection=validation_selection)
+            print(f"Restored best confidence checkpoint: epoch={confidence_monitor.best['epoch']}")
 
 
     if metrics_path is not None:
@@ -3088,6 +3268,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="JSONL with video, text and per-character (or pretrained-token) frame windows",
     )
     p.add_argument("--output", default="unnoba.pt")
+    p.add_argument("--validation-manifest", default=None,
+                   help="Separate validation JSONL; enables best-checkpoint selection and early stopping")
+    p.add_argument("--early-stopping-patience", type=int, default=5,
+                   help="Epochs without validation-loss improvement before stopping each stage (default: 5; 0 disables)")
+    p.add_argument("--early-stopping-min-delta", type=float, default=0.0,
+                   help="Minimum validation-loss decrease to reset patience (default: 0)")
     p.add_argument("--metrics-csv", default=None, metavar="PATH_OR_AUTO",
                    help="Write per-sample NLL/margin after training; auto uses CHECKPOINT_STEM.metrics.csv")
     p.add_argument("--metrics-include-eos", action="store_true",

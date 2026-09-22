@@ -20,6 +20,7 @@
 !tests/train_*
 !tests/test_download_recovery.py
 !tests/test_run_all_variants.py
+!tests/test_validation.py
 !tests/test_train_downvid.py
 !tests/test_hdtf_download.py
 !tests/test_fusion_options.py

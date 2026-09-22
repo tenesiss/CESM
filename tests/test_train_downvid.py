@@ -529,6 +529,30 @@ class GrouperIntegrationTests(PipelineFixture):
         self.assertEqual(args.manifest.read_text(), "previous dataset\n")
         self.assertEqual(len(train.load_manifest(str(args.manifest) + ".partial")), 1)
 
+    def test_validation_excludes_known_uploads_and_legacy_paths_without_using_attempts(self):
+        args = self.args("--max-attempts", "1")
+        rows = [self.row(), self.row(**{"start-time": 2, "end-time": 3}), self.row(1), self.row(2)]
+        excluded = self.root / "training.jsonl"
+        excluded.write_text("\n".join(map(json.dumps, [
+            {"video": str(self.root / "training.mp4"), "text": "hi", "windows": [[0, 1], [2, 3]],
+             "source_key": pipeline.Clip.from_row(rows[0]).source_key},
+            {"video": str(pipeline.download_folder(pipeline.Clip.from_row(rows[2]), args) / "video.mp4"),
+             "text": "hi", "windows": [[0, 1], [2, 3]]},
+        ])) + "\n")
+        args.exclude_manifest = excluded
+        calls = []
+
+        def downloader(clip, args):
+            calls.append(clip)
+            return self.video
+
+        self.prepare_with_fixtures(args, rows, downloader)
+        self.assertEqual(calls, [pipeline.Clip.from_row(rows[3])])
+        report = pipeline.read_cache(self.root / "run_report.json")
+        self.assertEqual(report["skipped_excluded_clips"], 3)
+        self.assertEqual(report["attempts"], 1)
+        self.assertEqual(train.load_manifest(args.manifest)[0]["source_key"], calls[0].source_key)
+
     def test_dead_upload_does_not_use_attempts_for_its_remaining_clips(self):
         args = self.args("--max-attempts", "2")
         rows = [self.row(i) for i in range(60)]

@@ -60,6 +60,31 @@ class AllVariantRunnerTests(unittest.TestCase):
             self.assertEqual(evaluate[evaluate.index("--device") + 1], "auto")
             self.assertNotIn("--max-frames", evaluate)  # Read each checkpoint's own section size.
 
+    def test_selected_variants_train_and_evaluate_once_in_numeric_order(self):
+        for source in (["-N", "3"], ["--manifest", "existing.jsonl"]):
+            for selection, expected in (([5], [5]), ([5, 2, 5], [2, 5])):
+                with self.subTest(source=source, selection=selection):
+                    _, snapshot, checkpoints, stages = self.plan([
+                        *source, "--variants", *map(str, selection),
+                        "--variant-args", "5:--lr 0.001 --max-frames 7",
+                    ])
+                    prefix = ["download"] if source[0] == "-N" else []
+                    self.assertEqual([s["name"] for s in stages], prefix + [
+                        name for index in expected for name in (f"train_{index}", f"evaluate_{index}")
+                    ])
+                    self.assertEqual(len(checkpoints), len(expected))
+                    for offset, index in enumerate(expected):
+                        module = runner.VARIANTS[index - 1]
+                        training, evaluation = stages[len(prefix) + 2 * offset:len(prefix) + 2 * offset + 2]
+                        actual = module.build_argparser().parse_args(training["command"][2:])
+                        self.assertEqual(actual.variant_name, module.DEFAULTS["variant_name"])
+                        self.assertEqual(actual.manifest, str(snapshot))
+                        self.assertEqual(Path(actual.output), checkpoints[offset])
+                        self.assertEqual(checkpoints[offset].name, Path(module.DEFAULTS["output"]).name)
+                        self.assertEqual(evaluation["csv"], str(checkpoints[offset].with_suffix(".metrics.csv")))
+                        if index == 5:
+                            self.assertEqual((actual.lr, actual.max_frames), (0.001, 7))
+
     def test_shared_specific_and_individual_parameters_route_to_correct_stages(self):
         _, _, _, stages = self.plan([
             "-N", "2", "--lr", "0.001", "--batch-size", "3", "--epochs", "2",
@@ -114,6 +139,37 @@ class AllVariantRunnerTests(unittest.TestCase):
             self.assertEqual(training.max_frames, 25)
             self.assertNotIn("--dataset=hdtf", stage["command"])
 
+    def test_validation_download_and_reused_manifests_route_to_selected_variants(self):
+        for source in (["-N", "3"], ["--manifest", "existing.jsonl"]):
+            for validation in (["--N-valid", "2"], ["--validation-manifest", "validation.jsonl"]):
+                with self.subTest(source=source, validation=validation):
+                    _, snapshot, _, stages = self.plan([
+                        *source, *validation, "--variants", "2", "5",
+                        "--early-stopping-patience", "3", "--early-stopping-min-delta", "0.01",
+                        "--variant-args", "5:--early-stopping-patience 7",
+                    ])
+                    downloads = [s for s in stages if s["name"].startswith("download")]
+                    self.assertEqual(len(downloads), int(source[0] == "-N") + int(validation[0] == "--N-valid"))
+                    if validation[0] == "--N-valid":
+                        args = train_downvid.build_argparser().parse_args(downloads[-1]["command"][2:])
+                        self.assertEqual(args.num_videos, 2)
+                        self.assertEqual(args.exclude_manifest, snapshot)
+                    elif source[0] == "-N":
+                        args = train_downvid.build_argparser().parse_args(downloads[0]["command"][2:])
+                        self.assertEqual(args.exclude_manifest, snapshot.with_name("validation_samples.jsonl"))
+                    for stage in stages[len(downloads):]:
+                        index = int(stage["name"].rsplit("_", 1)[1])
+                        if stage["name"].startswith("train_"):
+                            args = runner.VARIANTS[index - 1].build_argparser().parse_args(stage["command"][2:])
+                            self.assertEqual(args.validation_manifest, str(self.root / "run" / "validation_samples.jsonl"))
+                            self.assertEqual(args.early_stopping_patience, 7 if index == 5 else 3)
+                            self.assertEqual(args.early_stopping_min_delta, 0.01)
+                        else:
+                            is_validation = stage["name"].startswith("evaluate_validation_")
+                            expected = snapshot.with_name("validation_samples.jsonl") if is_validation else snapshot
+                            command = stage["command"]
+                            self.assertEqual(command[command.index("--manifest") + 1], str(expected))
+
     def test_invalid_or_dataset_changing_overrides_fail_before_download(self):
         for flags in (
             ["-N", "1", "--variant-args", "3:--manifest other.jsonl"],
@@ -126,6 +182,17 @@ class AllVariantRunnerTests(unittest.TestCase):
             ["-N", "1", "--lr", "nan"],
             ["-N", "1", "--batch-size", "0"],
             ["-N", "1", "--manifest", "existing.jsonl"],
+            ["-N", "1", "--variants"],
+            ["-N", "1", "--variants", "0"],
+            ["-N", "1", "--variants", "6"],
+            ["-N", "1", "--variants", "baseline"],
+            ["-N", "1", "--variants", "1", "--variant-args", "4:--lr 0.001"],
+            ["-N", "1", "--N-valid", "0"],
+            ["-N", "1", "--N-valid", "-1"],
+            ["-N", "1", "--N-valid", "2", "--validation-manifest", "other.jsonl"],
+            ["-N", "1", "--early-stopping-patience", "-1"],
+            ["-N", "1", "--early-stopping-min-delta", "nan"],
+            ["-N", "1", "--variant-args", "1:--validation-manifest other.jsonl"],
         ):
             with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.plan(flags)
@@ -196,6 +263,31 @@ class AllVariantRunnerTests(unittest.TestCase):
         self.assertTrue(all(s["status"] == "pending" for s in report["stages"][1:]))
         self.assertFalse((run_dir / "all_variants.csv").exists())
 
+    def test_incomplete_or_overlapping_validation_never_starts_training(self):
+        video = self.root / "clip.avi"
+        video.write_bytes(b"fixture")
+        row = {"video": str(video), "text": "a", "windows": [[0, 1]]}
+        source = self.root / "training.jsonl"
+        source.write_text(json.dumps(row) + "\n")
+        for mode in ("incomplete", "overlap"):
+            with self.subTest(mode=mode):
+                run_dir = self.root / mode
+
+                def download(command, log):
+                    self.assertEqual(log.stem, "download_validation")
+                    args = train_downvid.build_argparser().parse_args(command[2:])
+                    count = 1 if mode == "incomplete" else 2
+                    Path(args.manifest).write_text((json.dumps(row) + "\n") * count)
+
+                with patch.object(runner, "run_stage", side_effect=download) as execute, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(ValueError, "expected exactly|overlap"):
+                        runner.main(["--manifest", str(source), "--N-valid", "2", "--run-dir", str(run_dir)])
+                self.assertEqual(execute.call_count, 1)
+                report = json.loads((run_dir / "run.json").read_text())
+                self.assertEqual(report["status"], "failed")
+                self.assertTrue(all(s["status"] == "pending" for s in report["stages"][1:]))
+
     def test_later_failure_preserves_completed_csvs_and_stops_pipeline(self):
         source = self.root / "source.jsonl"
         video = self.root / "clip.avi"
@@ -249,6 +341,16 @@ class AllVariantRunnerTests(unittest.TestCase):
         self.assertFalse(previous.with_suffix(".csv.tmp").exists())
 
     def test_offline_download_handoff_trains_five_and_evaluates_exact_samples(self):
+        self.check_offline_download_handoff()
+
+    def test_offline_selected_variants_generate_only_their_metrics(self):
+        self.check_offline_download_handoff([5, 3, 5])
+
+    def test_offline_validation_download_training_and_separate_metrics(self):
+        self.check_offline_download_handoff([1, 5], validation=True)
+
+    def check_offline_download_handoff(self, variants=None, validation=False):
+        selected = list(range(1, 6)) if variants is None else sorted(set(variants))
         video = self.root / "clip.avi"
         writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 25, (32, 32))
         self.assertTrue(writer.isOpened())
@@ -259,6 +361,9 @@ class AllVariantRunnerTests(unittest.TestCase):
             writer.release()
         # Same video path deliberately appears twice with distinct true labels.
         rows = [{"video": str(video), "text": text, "windows": [[0, 2], [3, 5]]} for text in ("ab", "ba")]
+        validation_video = self.root / "validation.avi"
+        validation_video.write_bytes(video.read_bytes())
+        validation_rows = [dict(rows[0], video=str(validation_video), text="ac")]
         actual_run_stage = runner.run_stage
         downloads = []
         completed_metrics = []
@@ -267,7 +372,8 @@ class AllVariantRunnerTests(unittest.TestCase):
             if Path(command[1]).name == "train_downvid.py":
                 downloads.append(command)
                 args = train_downvid.build_argparser().parse_args(command[2:])
-                Path(args.manifest).write_text("".join(json.dumps(row) + "\n" for row in rows))
+                records = validation_rows if log.stem == "download_validation" else rows
+                Path(args.manifest).write_text("".join(json.dumps(row) + "\n" for row in records))
                 log.write_text("Offline fixture replaces network download/alignment.\n")
             else:
                 # Completed CSVs must already be published when the next training starts.
@@ -275,7 +381,7 @@ class AllVariantRunnerTests(unittest.TestCase):
                     with (run_dir / "all_variants.csv").open(newline="") as stream:
                         self.assertEqual(list(csv.DictReader(stream)), completed_metrics)
                 actual_run_stage(command, log)
-                if log.stem.startswith("evaluate_"):
+                if log.stem.startswith("evaluate_") and not log.stem.startswith("evaluate_validation_"):
                     metrics_path = Path(command[command.index("--output") + 1])
                     with metrics_path.open(newline="") as stream:
                         completed_metrics.extend(csv.DictReader(stream))
@@ -287,24 +393,50 @@ class AllVariantRunnerTests(unittest.TestCase):
             "--no-face-detector", "--mouth-size", "16", "--conv3d-channels", "8",
             "--d-video", "8", "--d-text", "8", "--d-fusion", "8", "--heads", "2",
             "--video-layers", "1", "--text-layers", "1", "--ff-mult", "1", "--dropout", "0",
-            "--log-every", "0", "--variant-args", "4:--w-t 0.5 --lr 0.001",
+            "--log-every", "0",
         ]
+        if 4 in selected:
+            flags += ["--variant-args", "4:--w-t 0.5 --lr 0.001"]
+        if variants is not None:
+            flags += ["--variants", *map(str, variants)]
+        if validation:
+            flags += ["--N-valid", "1"]
+        output = io.StringIO()
         with patch.dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1"), \
-                patch.object(runner, "run_stage", side_effect=stage), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(runner, "run_stage", side_effect=stage), contextlib.redirect_stdout(output):
             report = runner.main(flags)
-        self.assertEqual(len(downloads), 1)
+        self.assertEqual(len(downloads), 2 if validation else 1)
         self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["variants"], selected)
+        self.assertEqual(json.loads((run_dir / "run.json").read_text())["variants"], selected)
+        expected_stages = ["download", "download_validation"] if validation else ["download"]
+        for index in selected:
+            expected_stages += [f"train_{index}", f"evaluate_{index}"]
+            if validation:
+                expected_stages.append(f"evaluate_validation_{index}")
+        self.assertEqual([s["name"] for s in report["stages"]], expected_stages)
+        self.assertEqual(len(report["checkpoints"]), len(selected))
+        self.assertIn(f"({len(selected)}/{len(selected)} variants)", output.getvalue())
+        self.assertIn(f"Completed {len(selected)} selected variant(s) on 2 samples.", output.getvalue())
         self.assertTrue(all(s["status"] == "complete" for s in report["stages"]))
         self.assertEqual(train.load_manifest(report["samples"]["manifest"]), rows)
         with (run_dir / "all_variants.csv").open(newline="") as stream:
             metrics = list(csv.DictReader(stream))
-        self.assertEqual(len(metrics), 10)
+        self.assertEqual(len(metrics), 2 * len(selected))
         self.assertEqual(metrics, completed_metrics)
-        for index, checkpoint in enumerate(report["checkpoints"], 1):
+        self.assertEqual({m["variant"] for m in metrics}, {
+            runner.VARIANTS[index - 1].DEFAULTS["variant_name"] for index in selected
+        })
+        self.assertEqual({str(path) for path in (run_dir / "checkpoints").glob("*.pt")},
+                         set(report["checkpoints"]))
+        for index, checkpoint in zip(selected, report["checkpoints"]):
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
             self.assertEqual(saved["training_args"]["manifest"], report["samples"]["manifest"])
             self.assertEqual(saved["training_stage"], "confidence")
             self.assertTrue(saved["confidence"]["trained"])
+            if validation:
+                self.assertEqual(saved["training_args"]["validation_manifest"], report["validation_samples"]["manifest"])
+                self.assertEqual(set(saved["validation_selection"]), {"token", "confidence"})
             selected = [m for m in metrics if m["checkpoint"] == checkpoint]
             self.assertEqual([m["text"] for m in selected], ["ab", "ba"])
             self.assertEqual([m["sample_index"] for m in selected], ["0", "1"])
@@ -312,6 +444,14 @@ class AllVariantRunnerTests(unittest.TestCase):
             self.assertTrue(all(math_is_valid(m) for m in selected))
             with Path(checkpoint).with_suffix(".metrics.csv").open(newline="") as stream:
                 self.assertEqual(list(csv.DictReader(stream)), selected)
+        if validation:
+            self.assertEqual(train.load_manifest(report["validation_samples"]["manifest"]), validation_rows)
+            with Path(report["validation_csv"]).open(newline="") as stream:
+                validation_metrics = list(csv.DictReader(stream))
+            self.assertEqual(len(validation_metrics), len(report["variants"]))
+            self.assertTrue(all(row["text"] == "ac" for row in validation_metrics))
+            self.assertTrue(all(math_is_valid(row) for row in validation_metrics))
+            self.assertEqual({row["video"] for row in validation_metrics}, {str(validation_video)})
 
 
 def math_is_valid(row):
