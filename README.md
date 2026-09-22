@@ -38,8 +38,11 @@ Training has two stages:
 
 At inference, frames are processed one at a time and intermediate states are
 cached. The neural network uses only the frames seen so far. See
-[`train_mathematics.tex`](train_mathematics.tex) for the model equations,
-alignment rules, losses, and two-stage training procedure.
+[`model_architecture.tex`](model_architecture.tex) for the block-by-block
+forward pass, tensor shapes, fusion connections, and streaming order, and
+[`train_mathematics.tex`](train_mathematics.tex) for alignment rules, losses,
+and the two-stage training procedure. Both LaTeX documents compile independently;
+keep their PDFs together to use the companion-document links.
 
 ## Getting started
 
@@ -721,7 +724,8 @@ YouTube authentication and does not explain these player errors.
 | [`run_all_variants.py`](run_all_variants.py) | Shared-dataset orchestration for the five experiments. |
 | [`flash_mono.py`](flash_mono.py) | Streamed monotonic and aligned-window attention statistics. |
 | [`tests/`](tests/README.md) | Variant entry points, experiment reference, and regression checks. |
-| [`train_mathematics.tex`](train_mathematics.tex) | Mathematical formulation of the architecture and training procedure. |
+| [`model_architecture.tex`](model_architecture.tex) | Model blocks, tensor shapes, fusion routes, and streaming execution order. |
+| [`train_mathematics.tex`](train_mathematics.tex) | Alignment, prediction equations, losses, and two-stage training procedure. |
 
 ### Regression checks
 

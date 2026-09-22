@@ -53,6 +53,12 @@ derived from a frozen predictor. The presentation is restricted to
 mathematics and algorithmic operations.
 \end{abstract}
 
+The companion architecture document~\cite{architecture} follows the inputs
+through every model block, with a flow diagram, tensor shapes, fusion
+variants, and the cached streaming execution order. This document retains
+the equations needed to define the training objectives; the architecture
+document provides the detailed forward-pass reference.
+
 \section{Sequences, alignments, and causal information}
 \label{sec:alignment}
 
@@ -122,6 +128,9 @@ Token-aligned windows can instead be supplied directly. The resulting
 token windows must remain ordered and non-overlapping.
 
 \section{Causal representation learning}
+
+For the block order and intermediate tensor shapes, see the video and text
+path sections of the architecture document~\cite{architecture}.
 
 All learned affine maps below have independent parameters unless sharing
 is explicitly stated. Layer normalization $\LN$ acts on the feature
@@ -271,12 +280,18 @@ encoder is evaluated deterministically.
 \section{Multimodal prediction}
 
 The two modalities are mapped to a common width $d$ by bias-free
-projections:
+projections (or the optional video identity mapping described below):
 \begin{equation}
 \bar v_f=P_vv_f,\qquad \bar z_j=P_tz_j,
 \qquad \bar q_i=\bar z_{i-1}.
 \label{eq:projections}
 \end{equation}
+By default, both projections are learned and $d=d_{\mathrm{fusion}}$.
+With \texttt{--no-vproj}, $P_v$ is the identity, $d=d_v$, and $P_t$
+maps text to $d_v$; all subsequent fusion operations use this width.
+The earlier spatial encoder projection remains present. The architecture
+document~\cite{architecture} details these connections and the two
+prediction routes below.
 
 \subsection{Token-query variants}
 
@@ -318,12 +333,16 @@ d_f=\MHA(\bar V,\bar Z;M^{v\to t})_f.
 \end{equation}
 It uses the token head on a visual residual:
 \begin{align}
-h_f^{\mathrm{fr}}&=\LN_t(\bar v_f+d_f),\\
+h_f^{\mathrm{fr}}&=\LN_t(\bar v_f+w_vd_f),\\
 \widehat h_f^{\mathrm{fr}}
  &=\LN_{t,\mathrm{out}}\bigl(h_f^{\mathrm{fr}}+\FFN_t(h_f^{\mathrm{fr}})\bigr),\\
 \ell_f^{\mathrm{fr}}&=W_y\widehat h_f^{\mathrm{fr}}+b_y,
 \qquad p_f^{\mathrm{fr}}=\softmax(\ell_f^{\mathrm{fr}}).
 \end{align}
+Here $w_v$ is the fixed, finite \texttt{--vcross-weight} scalar, whose
+default is one. At $w_v=0$, frame-token logits depend only on video.
+This multiplier applies only to frame-token fusion; the confidence
+branch below always uses $\bar v_f+d_f$.
 For $f\in\mathcal W_i$, the current frame label is $y_i$.
 Optional window phasing also supervises $y_{i-1}$ near the start of
 the window, as defined in Section~\ref{sec:window-phasing}.
@@ -477,6 +496,8 @@ at least one supervised prediction position are eligible. Averaging
 \emph{per-example} penalties over these examples defines
 $\mathcal L_{v,\mathrm{geom}}$, $\mathcal L_{t,\mathrm{geom}}$,
 $\mathcal L_{v,\mathrm{norm}}$, and $\mathcal L_{t,\mathrm{norm}}$.
+When \texttt{--no-vproj} is enabled, both video projection penalties
+are skipped and contribute zero; text projection penalties are unchanged.
 
 \subsection{Attention and cross-modal magnitude penalties}
 
@@ -771,6 +792,10 @@ to construct confidence targets.
 
 \subsection{Causal sequential realization}
 
+For the step-by-step streaming calls and the caches retained by each
+block, see the execution-order section of the architecture
+document~\cite{architecture}.
+
 Within the chosen visual context, frame $f$ produces $v_f$ from frames
 through $f$ and combines it with text states committed before its
 video-to-text attention step. A token query predicts from all visual
@@ -785,5 +810,12 @@ same video context and text-commit history. Confidence target
 construction uses the aligned teacher-forced history; a generated
 history with different tokens or commit times defines different
 conditioning information.
+
+\begin{thebibliography}{9}
+\bibitem{architecture}
+\emph{Causal Video-to-Text Learning: Model Architecture and Forward-Pass
+Sequence}. Companion document, \texttt{model\_architecture.tex}.
+\href{model_architecture.pdf}{Compiled architecture document}.
+\end{thebibliography}
 
 \end{document}
