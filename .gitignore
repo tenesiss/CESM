@@ -29,3 +29,4 @@
 !tests/test_window_phasing.py
 !tests/test_infer_cooldown.py
 !tests/test_learning_curves.py
+!tests/test_visual_pretraining.py

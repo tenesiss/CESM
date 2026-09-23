@@ -39,6 +39,9 @@ Training has two stages:
      U and future-distribution instability Q (Jensen-Shannon divergence with the
      document's log-sum-exp aggregation).
 
+Optionally, --pretrain-visual-encoder first trains the video encoder on an
+unannotated --pretrain-manifest using temporal and augmented-view MSE.
+
 The supplied frame windows are also used as causal supervision: target token t
 may only cross-attend to frames up through the end of its own window. The
 video->text path receives the dual causal mask: a frame can only attend to text
@@ -513,7 +516,8 @@ def count_video_frames(path: str) -> int:
 # -----------------------------------------------------------------------------
 
 
-def load_manifest(path: str) -> List[dict]:
+def load_manifest(path: str, *, video_only: bool = False) -> List[dict]:
+    """Resolve video paths; self-supervised manifests need no annotations."""
     base = Path(path).resolve().parent
     rows = []
     with open(path, "r", encoding="utf-8") as f:
@@ -522,7 +526,7 @@ def load_manifest(path: str) -> List[dict]:
             if not line:
                 continue
             row = json.loads(line)
-            for key in ("video", "text", "windows"):
+            for key in (("video",) if video_only else ("video", "text", "windows")):
                 if key not in row:
                     raise ValueError(f"{path}:{line_no}: missing key {key!r}")
             vp = Path(row["video"])
@@ -533,6 +537,54 @@ def load_manifest(path: str) -> List[dict]:
     if not rows:
         raise ValueError(f"Manifest is empty: {path}")
     return rows
+
+
+class PretrainVideoDataset(Dataset):
+    """Unannotated mouth videos, with the same bounded decoding as training."""
+
+    def __init__(self, rows, mouth_size, *, use_face_detector=True,
+                 max_frames=None, video_dtype=torch.float32):
+        if max_frames is not None and max_frames <= 0:
+            raise ValueError("--max-frames must be > 0")
+        self.rows = list(rows)
+        self.mouth_size = mouth_size
+        self.use_face_detector = use_face_detector
+        self.video_dtype = video_dtype
+        self.sections = []
+        frame_counts = {}
+        for row_idx, row in enumerate(self.rows):
+            if max_frames is None:
+                self.sections.append((row_idx, 0, None))
+                continue
+            path = row["video"]
+            if path not in frame_counts:
+                frame_counts[path] = count_video_frames(path)
+            count = frame_counts[path]
+            for start in range(0, count, max_frames):
+                self.sections.append((row_idx, start, min(max_frames, count - start)))
+
+    def __len__(self):
+        return len(self.sections)
+
+    def __getitem__(self, idx):
+        row_idx, start, count = self.sections[idx]
+        path = self.rows[row_idx]["video"]
+        video, _ = read_video_mouth_tensor(
+            path, self.mouth_size, use_face_detector=self.use_face_detector,
+            start_frame=start, max_frames=count, video_dtype=self.video_dtype,
+        )
+        if count is not None and len(video) != count:
+            raise RuntimeError(f"{path}: could not decode indexed section [{start}, {start + count})")
+        return {"video": video, "path": path}
+
+
+def collate_pretrain_videos(batch: Sequence[dict]) -> dict:
+    lengths = torch.tensor([len(item["video"]) for item in batch], dtype=torch.long)
+    sample = batch[0]["video"]
+    video = sample.new_zeros(len(batch), int(lengths.max()), *sample.shape[1:])
+    for i, item in enumerate(batch):
+        video[i, :len(item["video"])] = item["video"]
+    return {"video": video, "video_lengths": lengths}
 
 
 def video_identity_keys(rows: Sequence[dict]) -> set:
@@ -1866,6 +1918,79 @@ class UnnobaModel(nn.Module):
 # -----------------------------------------------------------------------------
 
 
+def temporal_visual_loss(z: torch.Tensor, lengths: torch.Tensor, adjacent_frames: int = 2) -> torch.Tensor:
+    """Mean feature MSE over unique valid pairs with 0 < j-i < adjacent_frames."""
+    if adjacent_frames < 2:
+        raise ValueError("--pretrain-adjacent-frames must be >= 2")
+    z = z.float()
+    valid = torch.arange(z.shape[1], device=z.device)[None, :] < lengths[:, None]
+    # An empty slice gives a differentiable zero even with no valid pairs.
+    total = z[:, :0].sum()
+    count = lengths.new_zeros(())
+    for offset in range(1, min(adjacent_frames, z.shape[1])):
+        pairs = valid[:, :-offset] & valid[:, offset:]
+        # Select before arithmetic so padded representations cannot contribute.
+        errors = (z[:, :-offset][pairs] - z[:, offset:][pairs]).square().mean(-1)
+        total = total + errors.sum()
+        count = count + pairs.sum()
+    return total / count.clamp_min(1)
+
+
+def augmentation_visual_loss(z1: torch.Tensor, z2: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Mean feature MSE over valid frames, excluding batch padding."""
+    valid = torch.arange(z1.shape[1], device=z1.device)[None, :] < lengths[:, None]
+    errors = (z1[valid].float() - z2[valid].float()).square().mean(-1)
+    return errors.sum() / valid.sum().clamp_min(1)
+
+
+@torch.no_grad()
+def augment_pretrain_video(video: torch.Tensor, lengths: torch.Tensor,
+                           original_probability: float = 0.2) -> torch.Tensor:
+    """Independently jitter each valid frame; sometimes retain it exactly.
+
+    Inputs/outputs are RGB in [-1,1]. Each call resamples brightness/contrast
+    factors in [0.8,1.2], a rotation in [-5,5] degrees, and identity choices.
+    """
+    if not 0 <= original_probability <= 1:
+        raise ValueError("original_probability must be in [0,1]")
+    valid = torch.arange(video.shape[1], device=video.device)[None, :] < lengths[:, None]
+    output = torch.zeros_like(video)
+    frames = video[valid]
+    if len(frames) == 0:
+        return output
+    # Grid sampling and color arithmetic use FP32 even when decoded frames
+    # are stored in FP16/BF16 under AMP.
+    with torch.autocast(device_type=video.device.type, enabled=False):
+        pixels = (frames.float() + 1) / 2
+        n = len(pixels)
+        brightness = 0.8 + 0.4 * torch.rand(n, 1, 1, 1, device=video.device)
+        contrast = 0.8 + 0.4 * torch.rand(n, 1, 1, 1, device=video.device)
+        mean = pixels.mean(dim=(1, 2, 3), keepdim=True)
+        pixels = ((pixels - mean) * contrast + mean) * brightness
+        angle = (torch.rand(n, device=video.device) * 2 - 1) * math.radians(5)
+        theta = pixels.new_zeros(n, 2, 3)
+        theta[:, 0, 0] = theta[:, 1, 1] = angle.cos()
+        theta[:, 0, 1] = -angle.sin()
+        theta[:, 1, 0] = angle.sin()
+        grid = F.affine_grid(theta, pixels.shape, align_corners=False)
+        pixels = F.grid_sample(pixels, grid, padding_mode="border", align_corners=False)
+        augmented = (pixels.clamp(0, 1) * 2 - 1).to(dtype=video.dtype)
+        keep = torch.rand(n, 1, 1, 1, device=video.device) < original_probability
+        output[valid] = torch.where(keep, frames, augmented)
+    return output
+
+
+def visual_pretraining_losses(encoder: VideoEncoder, batch: dict,
+                             adjacent_frames: int = 2) -> Dict[str, torch.Tensor]:
+    video, lengths = batch["video"], batch["video_lengths"]
+    # z is the final video representation, after the temporal stack and norm.
+    temporal = temporal_visual_loss(encoder(video, lengths), lengths, adjacent_frames)
+    z1 = encoder(augment_pretrain_video(video, lengths), lengths)
+    z2 = encoder(augment_pretrain_video(video, lengths), lengths)
+    augmentation = augmentation_visual_loss(z1, z2, lengths)
+    return {"total": temporal + augmentation, "temporal": temporal, "augmentation": augmentation}
+
+
 def similarity_preservation_loss(x: torch.Tensor, y: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     losses = []
     for b, L in enumerate(lengths.tolist()):
@@ -2686,6 +2811,7 @@ def save_checkpoint(
             "use_face_detector": not args.no_face_detector,
         },
         "epoch": epoch,
+        "pretrain_epoch": getattr(args, "pretrain_epoch", 0),
         "confidence_epoch": confidence_epoch,
         "training_stage": stage,
         "sectioning": {
@@ -2891,14 +3017,86 @@ def configure_token_stage(model: UnnobaModel) -> List[nn.Parameter]:
     return [parameter for parameter in model.parameters() if parameter.requires_grad]
 
 
+def pretrain_visual_encoder(model, loader, tokenizer, device, args, *, token_epoch=0) -> None:
+    """Optimize only the video encoder, then restore the caller's trainability."""
+    parameters = list(model.parameters())
+    trainability = [p.requires_grad for p in parameters]
+    modes = [(module, module.training) for module in model.modules()]
+    for parameter in parameters:
+        parameter.requires_grad_(False)
+    visual_params = list(model.video_encoder.parameters())
+    for parameter in visual_params:
+        parameter.requires_grad_(True)
+    amp_enabled = args.amp and device.type == "cuda"
+    opt = torch.optim.AdamW(visual_params, lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    global_step = 0
+    try:
+        for _ in range(args.pretrain_epochs):
+            epoch = args.pretrain_epoch + 1
+            model.eval()
+            model.video_encoder.train()
+            sums = {"total": 0.0, "temporal": 0.0, "augmentation": 0.0}
+            n = 0
+            for batch in loader:
+                opt.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+                    batch = move_batch(batch, device)
+                    losses = visual_pretraining_losses(
+                        model.video_encoder, batch, args.pretrain_adjacent_frames,
+                    )
+                scaler.scale(losses["total"]).backward()
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(visual_params, args.grad_clip)
+                scaler.step(opt)
+                scaler.update()
+                for key in sums:
+                    sums[key] += float(losses[key].detach())
+                n += 1
+                global_step += 1
+                if args.log_every and global_step % args.log_every == 0:
+                    msg = " ".join(f"{key}={value / n:.4f}" for key, value in sums.items())
+                    print(f"pretrain epoch={epoch} step={global_step} {msg}")
+                losses = None  # Release all three forward graphs before the next batch.
+            if n == 0:
+                raise ValueError("No videos were available for visual pretraining")
+            args.pretrain_epoch = epoch
+            msg = " ".join(f"{key}={value / n:.4f}" for key, value in sums.items())
+            print(f"pretrain epoch={epoch} done {msg}")
+            save_checkpoint(args.output, model, tokenizer, args, token_epoch, stage="pretrain")
+            print(f"saved {args.output}")
+    finally:
+        for parameter, requires_grad in zip(parameters, trainability):
+            parameter.grad = None
+            parameter.requires_grad_(requires_grad)
+        for module, mode in modes:
+            module.training = mode
+
+
 def train(args) -> None:
     validate_early_stopping_args(args)
     accuracy_decode_args(args)
+    if args.pretrain_manifest and not args.pretrain_visual_encoder:
+        raise ValueError("--pretrain-manifest requires --pretrain-visual-encoder")
+    if args.pretrain_visual_encoder and not args.pretrain_manifest:
+        raise ValueError("--pretrain-visual-encoder requires --pretrain-manifest")
+    if args.pretrain_epochs <= 0:
+        raise ValueError("--pretrain-epochs must be > 0")
+    if args.pretrain_adjacent_frames < 2:
+        raise ValueError("--pretrain-adjacent-frames must be >= 2")
+    if args.pretrain_visual_encoder and args.confidence_only:
+        raise ValueError("--pretrain-visual-encoder cannot be combined with --confidence-only")
     metrics_path = None
     if args.metrics_csv:
         metrics_path = str(Path(args.output).with_suffix(".metrics.csv")) if args.metrics_csv == "auto" else args.metrics_csv
         if Path(metrics_path).resolve() in (Path(args.output).resolve(), Path(args.manifest).resolve()):
             raise ValueError("--metrics-csv must differ from the checkpoint and manifest paths")
+    if args.pretrain_manifest:
+        protected = {Path(args.output).resolve()}
+        if metrics_path:
+            protected.add(Path(metrics_path).resolve())
+        if Path(args.pretrain_manifest).resolve() in protected:
+            raise ValueError("--output and --metrics-csv must differ from --pretrain-manifest")
     for option in ("lambda_tcross", "tcross_margin"):
         value = getattr(args, option)
         if not math.isfinite(value) or value < 0:
@@ -2919,7 +3117,8 @@ def train(args) -> None:
         if args.confidence_epochs == 0:
             raise ValueError("--confidence-only requires --confidence-epochs > 0")
         args.epochs = 0
-    if args.epochs == 0 and not args.resume:
+    pretrain_only = args.pretrain_visual_encoder and args.epochs == 0 and args.confidence_epochs == 0
+    if args.epochs == 0 and not args.resume and not pretrain_only:
         raise ValueError("--epochs 0 requires --resume; otherwise the token model would be random")
     if args.confidence_beta <= 0:
         raise ValueError("--confidence-beta must be > 0")
@@ -2933,7 +3132,8 @@ def train(args) -> None:
     curves = LearningCurveLogger(args)
     if curves.selected:
         protected = {Path(path).resolve() for path in
-                     (args.output, args.manifest, args.validation_manifest, args.resume, metrics_path) if path}
+                     (args.output, args.manifest, args.pretrain_manifest,
+                      args.validation_manifest, args.resume, metrics_path) if path}
         if protected & {curves.csv_path.resolve(), curves.plot_path.resolve()}:
             raise ValueError("Learning-curve output paths must differ from checkpoints, manifests and --metrics-csv")
         print(f"learning curves enabled: {', '.join(curves.selected)}; "
@@ -2941,9 +3141,12 @@ def train(args) -> None:
 
     seed_everything(args.seed)
     rows = load_manifest(args.manifest)
+    pretrain_rows = load_manifest(args.pretrain_manifest, video_only=True) if args.pretrain_visual_encoder else None
     validation_rows = load_manifest(args.validation_manifest) if args.validation_manifest else None
     if validation_rows is not None:
         validate_validation_split(rows, validation_rows)
+        if pretrain_rows is not None:
+            validate_validation_split(pretrain_rows, validation_rows)
         if Path(args.output).resolve() == Path(args.validation_manifest).resolve():
             raise ValueError("--output must differ from --validation-manifest")
         if metrics_path and Path(metrics_path).resolve() == Path(args.validation_manifest).resolve():
@@ -3096,11 +3299,13 @@ def train(args) -> None:
     )
 
     start_epoch = 0
+    args.pretrain_epoch = 0
     prior_confidence_epoch = 0
     confidence_already_trained = False
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model_state"], strict=True)
         start_epoch = int(resume_ckpt.get("epoch", 0) or 0)
+        args.pretrain_epoch = int(resume_ckpt.get("pretrain_epoch", 0) or 0)
         prior_confidence_epoch = int(resume_ckpt.get("confidence_epoch", 0) or 0)
         confidence_already_trained = bool(resume_ckpt.get("confidence", {}).get("trained", False))
         if args.epochs == 0:
@@ -3120,10 +3325,12 @@ def train(args) -> None:
     model = model.to(device)
 
     # Any update to shared token/video features invalidates a previously fitted
-    # confidence calibration, so a new token-training stage resets its status.
-    if args.epochs > 0:
+    # confidence calibration, so token training or pretraining resets its status.
+    if args.epochs > 0 or args.pretrain_visual_encoder:
         prior_confidence_epoch = 0
         confidence_already_trained = False
+        if args.pretrain_visual_encoder:
+            validation_selection.clear()
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -3143,6 +3350,20 @@ def train(args) -> None:
         print(f"frame vcross_weight={cfg.frame_vcross_weight:g} window_phasing={args.window_phasing:g}")
     if args.flash_mono and cfg.text_fusion != "frame":
         print("flash-mono: streamed pre-dropout attention losses; token attention uses SDPA")
+
+    if pretrain_rows is not None:
+        pretrain_ds = PretrainVideoDataset(
+            pretrain_rows, cfg.mouth_size, use_face_detector=not args.no_face_detector,
+            max_frames=args.max_frames, video_dtype=ds.video_dtype,
+        )
+        pretrain_loader = DataLoader(
+            pretrain_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
+            collate_fn=collate_pretrain_videos, pin_memory=device.type == "cuda",
+        )
+        print(f"pretrain videos={len(pretrain_rows)} sections={len(pretrain_ds)} "
+              f"adjacent_frames={args.pretrain_adjacent_frames}")
+        pretrain_visual_encoder(model, pretrain_loader, tokenizer, device, args, token_epoch=start_epoch)
+        del pretrain_loader, pretrain_ds
 
     # ------------------------------------------------------------------
     # Stage 1: token/frame prediction; confidence-only layers are not used.
@@ -3355,6 +3576,14 @@ def build_argparser() -> argparse.ArgumentParser:
         help="JSONL with video, text and per-character (or pretrained-token) frame windows",
     )
     p.add_argument("--output", default="unnoba.pt")
+    p.add_argument("--pretrain-visual-encoder", action="store_true",
+                   help="Pretrain the full video encoder with temporal and augmentation MSE before token training")
+    p.add_argument("--pretrain-manifest", default=None,
+                   help="Pretraining JSONL with video paths; text/windows are optional and ignored")
+    p.add_argument("--pretrain-epochs", type=int, default=5,
+                   help="Additional visual pretraining epochs when enabled (default: 5); uses --lr and --weight-decay")
+    p.add_argument("--pretrain-adjacent-frames", type=int, default=2, metavar="N",
+                   help="Compare each valid frame pair with 0 < j-i < N once (default: 2, consecutive pairs)")
     p.add_argument("--validation-manifest", default=None,
                    help="Separate validation JSONL; enables best-checkpoint selection and early stopping")
     p.add_argument("--early-stopping-patience", type=int, default=5,

@@ -12,6 +12,7 @@ the character level; a Hugging Face causal language model can replace it.
 
 - [Getting started](#getting-started): install, train, and transcribe a video.
 - [Data and alignment](#data-and-alignment): prepare a JSONL training manifest.
+- [Visual encoder pretraining](#visual-encoder-pretraining): learn from unannotated videos.
 - [Pretrained text encoder](#pretrained-text-encoder): use a frozen or fine-tuned LM.
 - [Checkpoints and inference](#checkpoints-and-inference): load, resume, and train confidence.
 - [Architecture experiments](#architecture-experiments): compare the five variants.
@@ -35,6 +36,8 @@ Training has two stages:
    nonzero regularization weights by default.
 2. Freeze the token prediction path and train confidence from the predictor's
    normalized entropy and future-distribution instability.
+
+An optional self-supervised visual pretraining stage can run before these stages.
 
 At inference, frames are processed one at a time and intermediate states are
 cached. The neural network uses only the frames seen so far. See
@@ -114,6 +117,84 @@ are also accepted when their window count differs from the source-text length.
 If the token and character counts happen to be equal, set
 `"window_unit":"token"` on the row to remove the ambiguity. Use exactly the
 same tokenizer/model named by `--pretrained-lm` when creating such alignments.
+
+## Visual encoder pretraining
+
+Use `--pretrain-visual-encoder` with `--pretrain-manifest` to pretrain the full
+video encoder before supervised training:
+
+```bash
+python3 train.py \
+  --manifest data/train.jsonl \
+  --pretrain-visual-encoder \
+  --pretrain-manifest data/unlabeled.jsonl \
+  --pretrain-epochs 5 \
+  --pretrain-adjacent-frames 2 \
+  --max-frames 256 \
+  --output checkpoints/cesm.pt
+```
+
+The pretraining manifest only needs `{"video":"clips/example.mp4"}` per line.
+Paths resolve relative to that manifest; any text or alignment fields are
+ignored. Pretraining videos must be disjoint from `--validation-manifest`,
+including source uploads when `source_key` is provided.
+
+For the final per-frame video representations (after the temporal stack and
+output normalization), the loss is the sum of two equally weighted terms:
+
+- Temporal MSE: average feature MSE over all valid pairs `(i,j)` with
+  `0 < j-i < N`, where `N = --pretrain-adjacent-frames` (at least 2). The default
+  compares consecutive frames only. Each pair is counted once, padding is
+  excluded, and clips with one frame contribute no temporal pairs.
+- Augmentation MSE: independently generate two views per frame and average
+  their representation MSE over valid frames. Each view samples brightness and
+  contrast factors from `[0.8,1.2]` and rotation from `[-5,5]` degrees, with a 20%
+  chance per frame of keeping the exact original image. Views are resampled
+  every step; padded frames contribute no loss.
+
+Only the video encoder is updated in this stage. It uses `--lr`,
+`--weight-decay`, `--grad-clip`, `--batch-size`, and `--amp`; pretraining defaults
+to five epochs. `--max-frames` also bounds pretraining sections, and temporal
+pairs stay within each section. These are the two MSE objectives only; no
+variance or contrastive objective is added to prevent constant representations.
+
+To save after pretraining without running the supervised stages, add
+`--epochs 0 --confidence-epochs 0`. The aligned `--manifest` is still required
+to initialize the supervised tokenizer for the checkpoint. Resume with
+`--resume checkpoints/cesm.pt`; omitting both pretraining flags starts supervised
+training directly, while including them runs additional pretraining epochs.
+The checkpoint preserves the cumulative `pretrain_epoch` count. Changing the
+video encoder clears any previously trained confidence status.
+
+For download workflows, `--N-pretrain` sets the number of pretraining videos
+independently of `-N`, which still counts aligned supervised clips. It enables
+pretraining automatically in `train_downvid.py`, its `train_talkvid.py`
+compatibility entry point, and `run_all_variants.py`:
+
+```bash
+python3 train_downvid.py --dataset hdtf -N 20 --N-pretrain 100 \
+  --pretrain-epochs 5 --output checkpoints/cesm.pt
+
+python3 run_all_variants.py -N 20 --N-pretrain 100 --N-valid 5 \
+  --dataset-language English --run-dir runs/pretrained_variants
+```
+
+Pretraining downloads skip Whisper, tokenization, and frame alignment. They use
+the same dataset, language filter, start index, frame cap, and download cache as
+supervised preparation, so pretraining and supervised videos may overlap.
+Validation videos/source uploads are excluded. Preparation must reach each
+requested count before training starts; failures retain partial manifests and
+cached downloads for recovery.
+
+The downloader writes `WORK_DIR/pretrain.jsonl` by default; with `--N-pretrain`,
+`--pretrain-manifest PATH` chooses its output path. Without `--N-pretrain`, that
+option reuses an existing manifest. To only prepare unannotated videos, use
+`train_downvid.py --N-pretrain 100 --prepare-only` without `-N`.
+
+The variant runner downloads the pretraining set once, records its count and
+checksum in `run.json`, and passes the same `pretrain_samples.jsonl` snapshot to
+every selected variant. Each variant pretrains its own encoder. Use
+`--pretrain-manifest PATH` instead of `--N-pretrain` to reuse an existing set.
 
 ## Pretrained text encoder
 

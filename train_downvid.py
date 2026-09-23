@@ -4,6 +4,7 @@
 All training options come directly from train.build_argparser(). See --help
 and README.md for download/preprocessing options. N counts usable clips, not
 unique source YouTube uploads. HDTF uses hosted videos without YouTube access.
+--N-pretrain independently counts unannotated videos for visual pretraining.
 """
 
 from __future__ import annotations
@@ -59,12 +60,17 @@ def build_argparser():
         if action.dest == "manifest":
             action.required = False
             action.help = "Generated JSONL path (default: WORK_DIR/data.jsonl)"
+        elif action.dest == "pretrain_manifest":
+            action.help = "Pretraining JSONL to reuse, or output path with --N-pretrain (default: WORK_DIR/pretrain.jsonl)"
     group = parser.add_argument_group("Dataset download and preprocessing")
     group.add_argument("--dataset", choices=["talkvid", "hdtf"], default="talkvid",
                        help="Video source (default: talkvid); hdtf downloads hosted MP4s without YouTube")
     group.add_argument("--num-videos", "-N", type=positive_int,
                        help="Number of successfully aligned videos/clips to train on; required "
-                            "except with --login or --logout")
+                            "except with --login, --logout, or --N-pretrain with --prepare-only")
+    group.add_argument("--N-pretrain", dest="num_pretrain", type=positive_int,
+                       help="Download exactly this many videos for self-supervised pretraining, without alignment; "
+                            "enables --pretrain-visual-encoder (default manifest: WORK_DIR/pretrain.jsonl)")
     group.add_argument("--work-dir", type=Path,
                        help="Download/alignment cache (default: data/DATASET beside this script)")
     group.add_argument("--hdtf-archive", default=DEFAULT_HDTF_ARCHIVE,
@@ -79,7 +85,7 @@ def build_argparser():
                        help="Exclude local videos and known source uploads from this JSONL (for validation downloads)")
     group.add_argument("--max-attempts", type=positive_int,
                        help="Maximum eligible, distinct clips to try; remaining clips from an "
-                            "unavailable upload are skipped without attempts (default: 10 * N)")
+                            "unavailable upload are skipped without attempts (default: 10 * max(N, N-pretrain))")
     group.add_argument("--download-timeout", type=positive_int, default=600,
                        help="Per-clip download timeout in seconds")
     group.add_argument("--download-retries", type=int, default=3)
@@ -746,28 +752,33 @@ def training_record(manifest, tokenizer, window_unit, video):
             "window_unit": window_unit}
 
 
-def prepare(args):
+def prepare(args, *, video_only=False):
     import train
 
-    grouper = load_grouper(args.group_frames_code)
-    tokenizer, unit, token_state, resume_chars = alignment_tokenizer(args)
-    config = {"version": 1, "tokenizer": token_state,
-              "grouper_sha256": hashlib.sha256(args.group_frames_code.read_bytes()).hexdigest(),
-              "whisper_model": args.whisper_model, "language": args.language,
-              "device": args.whisper_device, "compute_type": args.whisper_compute_type,
-              "image_ext": args.image_ext, "jpeg_quality": args.jpeg_quality}
-    if args.download_max_frames is not None:
-        config["download_max_frames"] = args.download_max_frames
-    config_key = digest(config)[:24]
+    resume_chars = None
+    if not video_only:
+        grouper = load_grouper(args.group_frames_code)
+        tokenizer, unit, token_state, resume_chars = alignment_tokenizer(args)
+        config = {"version": 1, "tokenizer": token_state,
+                  "grouper_sha256": hashlib.sha256(args.group_frames_code.read_bytes()).hexdigest(),
+                  "whisper_model": args.whisper_model, "language": args.language,
+                  "device": args.whisper_device, "compute_type": args.whisper_compute_type,
+                  "image_ext": args.image_ext, "jpeg_quality": args.jpeg_quality}
+        if args.download_max_frames is not None:
+            config["download_max_frames"] = args.download_max_frames
+        config_key = digest(config)[:24]
     source = args.hdtf_archive if args.dataset == "hdtf" else args.metadata
     report = {"dataset": args.dataset, "metadata": source, "requested": args.num_videos,
               "download_max_frames": args.download_max_frames,
               "manifest": str(args.manifest), "results": [], "failures": [],
               "unavailable_sources": {}, "skipped_unavailable_clips": 0,
               "skipped_excluded_clips": 0}
-    report_path = args.work_dir / "run_report.json"
+    report_path = args.work_dir / ("pretrain_report.json" if video_only else "run_report.json")
     records, seen = [], set()
-    excluded = train.video_identity_keys(train.load_manifest(args.exclude_manifest)) if args.exclude_manifest else set()
+    excluded = set()
+    for manifest_path in (args.exclude_manifest, args.validation_manifest):
+        if manifest_path:
+            excluded.update(train.video_identity_keys(train.load_manifest(manifest_path, video_only=True)))
     attempts = 0
     whisper = None
     languages = {value.casefold() for value in args.dataset_language}
@@ -813,47 +824,53 @@ def prepare(args):
                 try:
                     video = (download_hdtf_clip(clip, args, row["archive"], row["member"])
                              if args.dataset == "hdtf" else download_clip(clip, args))
-                    output = args.work_dir / "frames" / clip.key / config_key
-                    completed = output / "complete.json"
-                    signature = video_signature(video)
-                    cached = None
-                    if not args.reprocess and completed.exists():
-                        cached = read_cache(completed)
-                    manifest = read_cache(output / "manifest.json")
-                    if cached and cached.get("video_signature") == signature and manifest:
-                        print(f"  Reusing alignment: {output}", flush=True)
+                    if video_only:
+                        output = video.parent
+                        record = {"video": str(video.resolve())}
                     else:
-                        if whisper is None:
-                            try:
-                                whisper = grouper.WhisperModel(
-                                    args.whisper_model, device=args.whisper_device,
-                                    compute_type=args.whisper_compute_type,
-                                )
-                            except Exception as exc:
-                                # A model/device setup error affects every clip;
-                                # do not keep downloading replacement candidates.
-                                raise WhisperSetupError(f"Cannot initialize Whisper: {exc}") from exc
-                        # An interrupted/reprocessed run must not leave obsolete
-                        # token folders beside a new alignment.
-                        if output.exists():
-                            shutil.rmtree(output)
-                        print(f"  Transcribing and grouping frames: {video}", flush=True)
-                        manifest = grouper.group_frames_by_token(
-                            video, tokenizer, output, whisper_model=args.whisper_model,
-                            language=args.language, device=args.whisper_device,
-                            compute_type=args.whisper_compute_type, image_ext=args.image_ext,
-                            jpeg_quality=args.jpeg_quality, whisper_instance=whisper,
-                        )
-                    record = training_record(manifest, tokenizer, unit, video)
+                        output = args.work_dir / "frames" / clip.key / config_key
+                        completed = output / "complete.json"
+                        signature = video_signature(video)
+                        cached = None
+                        if not args.reprocess and completed.exists():
+                            cached = read_cache(completed)
+                        manifest = read_cache(output / "manifest.json")
+                        if cached and cached.get("video_signature") == signature and manifest:
+                            print(f"  Reusing alignment: {output}", flush=True)
+                        else:
+                            if whisper is None:
+                                try:
+                                    whisper = grouper.WhisperModel(
+                                        args.whisper_model, device=args.whisper_device,
+                                        compute_type=args.whisper_compute_type,
+                                    )
+                                except Exception as exc:
+                                    # A model/device setup error affects every clip;
+                                    # do not keep downloading replacement candidates.
+                                    raise WhisperSetupError(f"Cannot initialize Whisper: {exc}") from exc
+                            # An interrupted/reprocessed run must not leave obsolete
+                            # token folders beside a new alignment.
+                            if output.exists():
+                                shutil.rmtree(output)
+                            print(f"  Transcribing and grouping frames: {video}", flush=True)
+                            manifest = grouper.group_frames_by_token(
+                                video, tokenizer, output, whisper_model=args.whisper_model,
+                                language=args.language, device=args.whisper_device,
+                                compute_type=args.whisper_compute_type, image_ext=args.image_ext,
+                                jpeg_quality=args.jpeg_quality, whisper_instance=whisper,
+                            )
+                        record = training_record(manifest, tokenizer, unit, video)
+                        record["source_key"] = clip.source_key
+                        grouper.write_jsonl([record], output / "data.jsonl")
+                        write_json(completed, {"video_signature": signature, "config": config})
                     record["source_key"] = clip.source_key
-                    grouper.write_jsonl([record], output / "data.jsonl")
-                    write_json(completed, {"video_signature": signature, "config": config})
                     jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
                     jsonl.flush()
                     records.append(record)
                     report["results"].append({"index": index, "id": row.get("id"),
                                                "clip": clip.__dict__, "output": str(output)})
-                    print(f"  Ready: {len(record['windows'])} aligned tokens", flush=True)
+                    print("  Ready: pretraining video" if video_only else
+                          f"  Ready: {len(record['windows'])} aligned tokens", flush=True)
                 except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
                     report["failures"].append({"index": index, "clip": clip.__dict__, "error": str(exc)})
                     if isinstance(exc, (WhisperSetupError, DownloadSetupError, ArchiveAccessError)):
@@ -910,8 +927,8 @@ def training_command(args):
 
 
 def validate_args(parser, args):
-    if args.num_videos is None:
-        parser.error("--num-videos/-N is required except with --login or --logout")
+    if args.num_videos is None and not (args.num_pretrain is not None and args.prepare_only):
+        parser.error("--num-videos/-N is required except with --login, --logout, or --N-pretrain --prepare-only")
     args.work_dir = (args.work_dir or ROOT / "data" / args.dataset).expanduser().resolve()
     if args.dataset == "hdtf":
         if args.metadata != DEFAULT_METADATA:
@@ -925,16 +942,35 @@ def validate_args(parser, args):
             args.hdtf_archive = str(archive_path)
     args.manifest = (Path(args.manifest).expanduser().resolve() if args.manifest
                      else args.work_dir / "data.jsonl")
+    if args.num_pretrain is not None or args.pretrain_manifest:
+        args.pretrain_visual_encoder = True
+        args.pretrain_manifest = (str(Path(args.pretrain_manifest).expanduser().resolve())
+                                  if args.pretrain_manifest else str(args.work_dir / "pretrain.jsonl"))
+        if Path(args.pretrain_manifest) == args.manifest:
+            parser.error("--pretrain-manifest must differ from --manifest")
+        if args.num_pretrain is not None:
+            protected = (args.validation_manifest, args.exclude_manifest, args.output, args.resume)
+            if any(path and Path(path).expanduser().resolve() == Path(args.pretrain_manifest) for path in protected):
+                parser.error("Generated --pretrain-manifest must differ from validation/exclusion manifests and checkpoints")
+        elif not Path(args.pretrain_manifest).is_file():
+            parser.error(f"Pretraining manifest not found: {args.pretrain_manifest}")
+    if args.pretrain_visual_encoder and not args.pretrain_manifest:
+        parser.error("--pretrain-visual-encoder requires --N-pretrain or --pretrain-manifest")
+    if args.pretrain_visual_encoder and args.confidence_only:
+        parser.error("--pretrain-visual-encoder cannot be combined with --confidence-only")
+    if args.pretrain_epochs <= 0 or args.pretrain_adjacent_frames < 2:
+        parser.error("--pretrain-epochs must be > 0 and --pretrain-adjacent-frames must be >= 2")
     args.group_frames_code = args.group_frames_code.expanduser().resolve()
     if args.group_frames_code.is_dir():
         args.group_frames_code /= "group_video_frames_by_token.py"
-    if not args.group_frames_code.is_file():
+    if args.num_videos is not None and not args.group_frames_code.is_file():
         parser.error(f"Frame grouping code not found: {args.group_frames_code}")
     if args.start_index < 0 or args.download_retries < 0:
         parser.error("--start-index and --download-retries must be >= 0")
-    args.max_attempts = args.max_attempts or 10 * args.num_videos
-    if args.max_attempts < args.num_videos:
-        parser.error("--max-attempts must be >= --num-videos")
+    requested = max(args.num_videos or 0, args.num_pretrain or 0)
+    args.max_attempts = args.max_attempts or 10 * requested
+    if args.max_attempts < requested:
+        parser.error("--max-attempts must be >= --num-videos and --N-pretrain")
     if args.dataset == "talkvid":
         use_saved_login(args)
         if args.cookies and not args.cookies.expanduser().is_file():
@@ -949,11 +985,12 @@ def validate_args(parser, args):
         parser.error("--confidence-only requires --resume and --confidence-epochs > 0")
     if args.epochs < 0 or args.confidence_epochs < 0:
         parser.error("--epochs and --confidence-epochs must be >= 0")
-    if args.epochs == 0 and not args.resume and not args.prepare_only:
+    pretrain_only = args.pretrain_visual_encoder and args.confidence_epochs == 0
+    if args.epochs == 0 and not args.resume and not args.prepare_only and not pretrain_only:
         parser.error("--epochs 0 requires --resume")
     if args.fine_tune_pretrained_lm and not (args.resume or args.pretrained_lm):
         parser.error("--fine-tune-pretrained-lm requires --pretrained-lm or a compatible --resume")
-    dependencies = ["faster_whisper"]
+    dependencies = ["faster_whisper"] if args.num_videos is not None else []
     if args.dataset == "talkvid":
         dependencies.extend(["yt_dlp", "ijson"])
     missing = [name for name in dependencies
@@ -984,7 +1021,13 @@ def main(argv=None):
         return
     validate_args(parser, args)
     if args.prepare_only:
-        prepare(args)
+        if args.num_videos is not None:
+            prepare(args)
+        if args.num_pretrain is not None:
+            pretrain_args = argparse.Namespace(**vars(args))
+            pretrain_args.num_videos = args.num_pretrain
+            pretrain_args.manifest = Path(args.pretrain_manifest)
+            prepare(pretrain_args, video_only=True)
     else:
         # The preprocessing process exits before training allocates GPU memory,
         # releasing Whisper/CTranslate2 as well as tokenizer/checkpoint memory.

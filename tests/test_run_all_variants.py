@@ -193,9 +193,92 @@ class AllVariantRunnerTests(unittest.TestCase):
             ["-N", "1", "--early-stopping-patience", "-1"],
             ["-N", "1", "--early-stopping-min-delta", "nan"],
             ["-N", "1", "--variant-args", "1:--validation-manifest other.jsonl"],
+            ["-N", "1", "--N-pretrain", "0"],
+            ["-N", "1", "--N-pretrain", "-1"],
+            ["-N", "1", "--N-pretrain", "2", "--pretrain-manifest", "other.jsonl"],
+            ["-N", "1", "--pretrain-visual-encoder"],
+            ["-N", "1", "--N-pretrain", "2", "--pretrain-epochs", "0"],
+            ["-N", "1", "--N-pretrain", "2", "--pretrain-adjacent-frames", "1"],
+            ["-N", "1", "--variant-args", "1:--pretrain-manifest other.jsonl"],
         ):
             with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.plan(flags)
+
+    def test_pretraining_download_count_and_shared_manifest_route_separately(self):
+        for dataset in ("talkvid", "hdtf"):
+            with self.subTest(dataset=dataset):
+                _, _, _, stages = self.plan([
+                    "-N", "2", "--N-pretrain", "7", "--N-valid", "3", "--dataset", dataset,
+                    "--variants", "1", "5", "--pretrain-epochs", "2", "--pretrain-adjacent-frames", "4",
+                    "--pretrained-lm", "model", "--download-max-frames", "20",
+                ])
+                self.assertEqual([s["name"] for s in stages[:3]],
+                                 ["download", "download_validation", "download_pretrain"])
+                downloaded = [train_downvid.build_argparser().parse_args(s["command"][2:]) for s in stages[:3]]
+                self.assertEqual([d.num_videos for d in downloaded], [2, 3, None])
+                pretrain = downloaded[-1]
+                self.assertEqual(pretrain.num_pretrain, 7)
+                self.assertEqual(pretrain.dataset, dataset)
+                self.assertEqual(pretrain.download_max_frames, 20)
+                self.assertIsNone(pretrain.pretrained_lm)  # No tokenizer/alignment for unlabeled videos.
+                self.assertEqual(pretrain.exclude_manifest, self.root / "run" / "validation_samples.jsonl")
+                for stage in stages[3:]:
+                    if stage["name"].startswith("train_"):
+                        parsed = train.build_argparser().parse_args(stage["command"][2:])
+                        self.assertTrue(parsed.pretrain_visual_encoder)
+                        self.assertEqual(parsed.pretrain_manifest, str(self.root / "run" / "pretrain_samples.jsonl"))
+                        self.assertEqual((parsed.pretrain_epochs, parsed.pretrain_adjacent_frames), (2, 4))
+
+    def test_reused_pretraining_manifest_is_snapshotted_and_excluded_from_validation(self):
+        for name in ("train", "pretrain", "valid"):
+            (self.root / f"{name}.mp4").write_bytes(b"fixture")
+        training = {"video": str(self.root / "train.mp4"), "text": "a", "windows": [[0, 1]]}
+        pretraining = {"video": str(self.root / "pretrain.mp4"), "source_key": "unlabeled-upload"}
+        validation = dict(training, video=str(self.root / "valid.mp4"))
+        manifest = self.root / "train.jsonl"
+        manifest.write_text(json.dumps(training) + "\n")
+        pretrain_manifest = self.root / "unlabeled.jsonl"
+        pretrain_manifest.write_text(json.dumps(pretraining) + "\n")
+        run_dir = self.root / "reuse"
+
+        def stage(command, log):
+            if log.stem == "download_validation":
+                args = train_downvid.build_argparser().parse_args(command[2:])
+                self.assertEqual(train.load_manifest(args.exclude_manifest, video_only=True),
+                                 [training, pretraining])
+                Path(args.manifest).write_text(json.dumps(validation) + "\n")
+            elif log.stem == "train_1":
+                args = train.build_argparser().parse_args(command[2:])
+                self.assertTrue(args.pretrain_visual_encoder)
+                self.assertEqual(train.load_manifest(args.pretrain_manifest, video_only=True), [pretraining])
+            else:
+                train.write_metrics_csv(command[command.index("--output") + 1], [])
+
+        with patch.object(runner, "run_stage", side_effect=stage), contextlib.redirect_stdout(io.StringIO()):
+            report = runner.main(["--manifest", str(manifest), "--pretrain-manifest", str(pretrain_manifest),
+                                  "--N-valid", "1", "--variants", "1", "--run-dir", str(run_dir)])
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["pretrain_samples"]["count"], 1)
+        self.assertEqual(report["pretrain_samples"]["manifest"], str(run_dir / "pretrain_samples.jsonl"))
+        self.assertFalse(any(s["name"] == "download_pretrain" for s in report["stages"]))
+
+    def test_short_pretraining_download_never_starts_training(self):
+        video = self.root / "video.mp4"
+        video.write_bytes(b"fixture")
+        manifest = self.root / "train.jsonl"
+        manifest.write_text(json.dumps({"video": str(video), "text": "a", "windows": [[0, 1]]}) + "\n")
+        calls = []
+
+        def stage(command, log):
+            calls.append(log.stem)
+            args = train_downvid.build_argparser().parse_args(command[2:])
+            Path(args.pretrain_manifest).write_text(json.dumps({"video": str(video)}) + "\n")
+
+        with patch.object(runner, "run_stage", side_effect=stage), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "expected exactly 2"):
+                runner.main(["--manifest", str(manifest), "--N-pretrain", "2", "--variants", "1",
+                             "--run-dir", str(self.root / "short")])
+        self.assertEqual(calls, ["download_pretrain"])
 
     def test_projection_and_frame_weight_route_to_compatible_variants(self):
         _, _, _, stages = self.plan(['-N', '1', '--no-vproj', '--vcross-weight', '0.25'])
@@ -349,7 +432,10 @@ class AllVariantRunnerTests(unittest.TestCase):
     def test_offline_validation_download_training_and_separate_metrics(self):
         self.check_offline_download_handoff([1, 5], validation=True)
 
-    def check_offline_download_handoff(self, variants=None, validation=False):
+    def test_offline_pretraining_is_shared_and_runs_before_supervised_training(self):
+        self.check_offline_download_handoff([1, 5], validation=True, pretraining=True)
+
+    def check_offline_download_handoff(self, variants=None, validation=False, pretraining=False):
         selected = list(range(1, 6)) if variants is None else sorted(set(variants))
         video = self.root / "clip.avi"
         writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 25, (32, 32))
@@ -372,8 +458,13 @@ class AllVariantRunnerTests(unittest.TestCase):
             if Path(command[1]).name == "train_downvid.py":
                 downloads.append(command)
                 args = train_downvid.build_argparser().parse_args(command[2:])
-                records = validation_rows if log.stem == "download_validation" else rows
-                Path(args.manifest).write_text("".join(json.dumps(row) + "\n" for row in records))
+                if log.stem == "download_pretrain":
+                    records = [{"video": str(video)}]
+                    destination = args.pretrain_manifest
+                else:
+                    records = validation_rows if log.stem == "download_validation" else rows
+                    destination = args.manifest
+                Path(destination).write_text("".join(json.dumps(row) + "\n" for row in records))
                 log.write_text("Offline fixture replaces network download/alignment.\n")
             else:
                 # Completed CSVs must already be published when the next training starts.
@@ -401,15 +492,19 @@ class AllVariantRunnerTests(unittest.TestCase):
             flags += ["--variants", *map(str, variants)]
         if validation:
             flags += ["--N-valid", "1"]
+        if pretraining:
+            flags += ["--N-pretrain", "1", "--pretrain-epochs", "1"]
         output = io.StringIO()
         with patch.dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1"), \
                 patch.object(runner, "run_stage", side_effect=stage), contextlib.redirect_stdout(output):
             report = runner.main(flags)
-        self.assertEqual(len(downloads), 2 if validation else 1)
+        self.assertEqual(len(downloads), 1 + int(validation) + int(pretraining))
         self.assertEqual(report["status"], "complete")
         self.assertEqual(report["variants"], selected)
         self.assertEqual(json.loads((run_dir / "run.json").read_text())["variants"], selected)
         expected_stages = ["download", "download_validation"] if validation else ["download"]
+        if pretraining:
+            expected_stages.append("download_pretrain")
         for index in selected:
             expected_stages += [f"train_{index}", f"evaluate_{index}"]
             if validation:
@@ -445,6 +540,10 @@ class AllVariantRunnerTests(unittest.TestCase):
             self.assertEqual(saved["training_args"]["manifest"], report["samples"]["manifest"])
             self.assertEqual(saved["training_stage"], "confidence")
             self.assertTrue(saved["confidence"]["trained"])
+            if pretraining:
+                self.assertEqual(saved["pretrain_epoch"], 1)
+                self.assertEqual(saved["training_args"]["pretrain_manifest"], report["pretrain_samples"]["manifest"])
+                self.assertEqual(report["pretrain_samples"]["count"], 1)
             if validation:
                 self.assertEqual(saved["training_args"]["validation_manifest"], report["validation_samples"]["manifest"])
                 self.assertEqual(set(saved["validation_selection"]), {"token", "confidence"})

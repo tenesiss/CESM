@@ -154,6 +154,19 @@ class HDTFTests(PipelineFixture):
         self.assertEqual(len(report["failures"]), 1)
         self.assertEqual(self.prepare_fixture(args), 0)
 
+    def test_video_only_pretraining_replaces_bad_members_without_whisper(self):
+        args = self.hdtf_args("-N", "2", "--download-max-frames", "3")
+        args.manifest = self.root / "pretrain.jsonl"
+        with patch.object(pipeline, "load_grouper", side_effect=AssertionError("Whisper was loaded")), \
+                patch.object(pipeline, "download_clip", side_effect=AssertionError("YouTube called")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            pipeline.prepare(args, video_only=True)
+        rows = train.load_manifest(args.manifest, video_only=True)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(set(row) == {"video", "source_key"} for row in rows))
+        report = pipeline.read_cache(self.root / "pretrain_report.json")
+        self.assertEqual((report["usable"], report["attempts"]), (2, 3))
+
     def test_shortfall_preserves_final_manifest_and_start_index(self):
         args = self.hdtf_args("-N", "2", "--start-index", "3", "--download-max-frames", "12")
         args.manifest.write_text("previous manifest\n")

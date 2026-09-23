@@ -33,8 +33,8 @@ ROOT = Path(__file__).resolve().parent
 VARIANTS = (train_1_as_is, train_2_tcross_loss, train_3_no_ht0,
             train_4_weighted_ht0, train_5_frame_tokens)
 MANAGED = {"help", "manifest", "output", "resume", "confidence_only",
-           "text_fusion", "variant_name", "metrics_csv", "validation_manifest"}
-DOWNLOAD_ONLY = {"num_videos", "prepare_only", "login", "logout", "exclude_manifest"}
+           "text_fusion", "variant_name", "metrics_csv", "validation_manifest", "pretrain_manifest"}
+DOWNLOAD_ONLY = {"num_videos", "num_pretrain", "prepare_only", "login", "logout", "exclude_manifest"}
 SPECIFIC = {"lambda_tcross": {2}, "tcross_margin": {2}, "w_t": {4},
             "vcross_weight": {5}, "window_phasing": {5},
             "lambda_mono": {1, 2, 3, 4}, "lambda_align": {1, 2, 3, 4},
@@ -79,6 +79,11 @@ def build_argparser():
                             help="Download this many separate validation videos/clips; enables early stopping")
     validation.add_argument("--validation-manifest", type=Path,
                             help="Reuse a separate validation JSONL instead of downloading validation videos")
+    pretraining = parser.add_mutually_exclusive_group()
+    pretraining.add_argument("--N-pretrain", dest="num_pretrain", type=train_downvid.positive_int,
+                             help="Download this many unannotated pretraining videos once for all selected variants")
+    pretraining.add_argument("--pretrain-manifest", type=Path,
+                             help="Reuse these pretraining videos; either pretraining option enables --pretrain-visual-encoder")
     parser.add_argument("--run-dir", type=Path,
                         help="New output directory (default: runs/variants_TIMESTAMP beside this script)")
     parser.add_argument("--variants", type=int, nargs="+", choices=range(1, len(VARIANTS) + 1),
@@ -152,6 +157,10 @@ def validate_training_args(parser, args):
         parser.error(str(exc))
     if args.epochs <= 0 or args.confidence_epochs < 0:
         parser.error("Each variant requires --epochs > 0 and --confidence-epochs >= 0")
+    if args.pretrain_visual_encoder and not args.pretrain_manifest:
+        parser.error("--pretrain-visual-encoder requires --N-pretrain or --pretrain-manifest")
+    if args.pretrain_epochs <= 0 or args.pretrain_adjacent_frames < 2:
+        parser.error("--pretrain-epochs must be > 0 and --pretrain-adjacent-frames must be >= 2")
     if args.batch_size <= 0 or args.workers < 0:
         parser.error("--batch-size must be > 0 and --workers must be >= 0")
     if args.max_frames is not None and args.max_frames <= 0:
@@ -183,15 +192,17 @@ def build_commands(parser, args, run_dir):
         if index not in selected:
             parser.error(f"--variant-args targets variant {index}, which is not selected by --variants")
     snapshot = run_dir / "samples.jsonl"
+    pretraining = args.num_pretrain is not None or args.pretrain_manifest is not None
     stages = []
     prepared = args.manifest.expanduser().resolve() if args.manifest else run_dir / f"{args.dataset}.jsonl"
-    def download_command(count, manifest):
+    def download_command(count, manifest, *, video_only=False):
         command = [sys.executable, str(ROOT / "train_downvid.py"), "--prepare-only",
-                   f"--num-videos={count}", f"--manifest={manifest}"]
+                   f"--N-pretrain={count}" if video_only else f"--num-videos={count}",
+                   f"--pretrain-manifest={manifest}" if video_only else f"--manifest={manifest}"]
         for action in train_downvid.build_argparser()._actions:
             if action.dest in MANAGED | DOWNLOAD_ONLY:
                 continue
-            if action.dest not in actions or action.dest in ("pretrained_lm", "pretrained_lm_local_files_only"):
+            if action.dest not in actions or (not video_only and action.dest in ("pretrained_lm", "pretrained_lm_local_files_only")):
                 command.extend(option_tokens(action, getattr(args, action.dest, None)))
         return command
     if args.num_videos is not None:
@@ -202,8 +213,14 @@ def build_commands(parser, args, run_dir):
     if args.num_valid is not None:
         validation_prepared = run_dir / f"validation_{args.dataset}.jsonl"
         command = download_command(args.num_valid, validation_prepared)
-        command.append(f"--exclude-manifest={snapshot}")
+        excluded = run_dir / "validation_exclusions.jsonl" if args.pretrain_manifest else snapshot
+        command.append(f"--exclude-manifest={excluded}")
         stages.append({"name": "download_validation", "command": command})
+    if args.num_pretrain is not None:
+        command = download_command(args.num_pretrain, run_dir / f"pretrain_{args.dataset}.jsonl", video_only=True)
+        if args.num_valid is not None or args.validation_manifest is not None:
+            command.append(f"--exclude-manifest={run_dir / 'validation_samples.jsonl'}")
+        stages.append({"name": "download_pretrain", "command": command})
     checkpoints = []
     for index, module in enumerate(VARIANTS, 1):
         if index not in selected:
@@ -220,6 +237,8 @@ def build_commands(parser, args, run_dir):
                   f"--variant-name={module.DEFAULTS['variant_name']}"]
         if args.num_valid is not None or args.validation_manifest is not None:
             flags.append(f"--validation-manifest={run_dir / 'validation_samples.jsonl'}")
+        if pretraining:
+            flags.extend(["--pretrain-visual-encoder", f"--pretrain-manifest={run_dir / 'pretrain_samples.jsonl'}"])
         parsed = module.build_argparser().parse_args(flags)
         validate_training_args(parser, parsed)
         training_stage = {"name": f"train_{index}", "command": [sys.executable, module.__file__, *flags]}
@@ -267,8 +286,8 @@ def combine_metrics_csv(paths, output):
         temporary.unlink(missing_ok=True)
 
 
-def snapshot_samples(source, destination, expected_count=None):
-    rows = train.load_manifest(str(source))
+def snapshot_samples(source, destination, expected_count=None, *, video_only=False):
+    rows = train.load_manifest(str(source), video_only=video_only)
     if expected_count is not None and len(rows) != expected_count:
         raise ValueError(f"Prepared {len(rows)} samples; expected exactly {expected_count}. Training was not started.")
     for row in rows:
@@ -331,6 +350,11 @@ def main(argv=None):
                                else run_dir / f"validation_{args.dataset}.jsonl")
         report.update(validation_source=str(validation_prepared), validation_samples=None,
                       validation_csv=str(run_dir / "all_variants.validation.csv"))
+    pretrain_prepared = None
+    if args.num_pretrain is not None or args.pretrain_manifest is not None:
+        pretrain_prepared = (args.pretrain_manifest.expanduser().resolve() if args.pretrain_manifest
+                             else run_dir / f"pretrain_{args.dataset}.jsonl")
+        report.update(pretrain_source=str(pretrain_prepared), pretrain_samples=None)
     train_downvid.write_json(report_path, report)
     print(f"Run directory: {run_dir}", flush=True)
     try:
@@ -340,19 +364,35 @@ def main(argv=None):
             report["samples"] = snapshot_samples(prepared, snapshot)
         if args.validation_manifest:
             report["validation_samples"] = snapshot_samples(validation_prepared, run_dir / "validation_samples.jsonl")
+        if args.pretrain_manifest:
+            report["pretrain_samples"] = snapshot_samples(pretrain_prepared, run_dir / "pretrain_samples.jsonl",
+                                                          video_only=True)
         def verify_splits():
-            for split in ("samples", "validation_samples"):
+            for split in ("samples", "validation_samples", "pretrain_samples"):
                 if report.get(split) is not None:
                     verify_snapshot(report[split])
-            if report["samples"] is not None and report.get("validation_samples") is not None:
-                train.validate_validation_split(train.load_manifest(snapshot),
-                                                train.load_manifest(report["validation_samples"]["manifest"]))
+            if report.get("validation_samples") is not None:
+                validation_rows = train.load_manifest(report["validation_samples"]["manifest"])
+                for split in ("samples", "pretrain_samples"):
+                    if report.get(split) is not None:
+                        train.validate_validation_split(
+                            train.load_manifest(report[split]["manifest"], video_only=True), validation_rows,
+                        )
         verify_splits()
         for stage in report["stages"]:
             verify_splits()
             stage["status"] = "running"
             stage["log"] = str(run_dir / "logs" / f"{stage['name']}.log")
             train_downvid.write_json(report_path, report)
+            if stage["name"] == "download_validation" and args.pretrain_manifest:
+                # Validation excludes both supervised videos and reused
+                # unlabeled videos, including their original source uploads.
+                excluded = []
+                for split in ("samples", "pretrain_samples"):
+                    excluded.extend(train.load_manifest(report[split]["manifest"], video_only=True))
+                (run_dir / "validation_exclusions.jsonl").write_text(
+                    "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in excluded), encoding="utf-8",
+                )
             print(f"\n{stage['name']}: {shlex.join(stage['command'])}", flush=True)
             run_stage(stage["command"], Path(stage["log"]))
             if stage["name"] == "download":
@@ -360,6 +400,9 @@ def main(argv=None):
             if stage["name"] == "download_validation":
                 report["validation_samples"] = snapshot_samples(validation_prepared,
                                                                 run_dir / "validation_samples.jsonl", args.num_valid)
+            if stage["name"] == "download_pretrain":
+                report["pretrain_samples"] = snapshot_samples(pretrain_prepared, run_dir / "pretrain_samples.jsonl",
+                                                              args.num_pretrain, video_only=True)
             verify_splits()
             if "csv" in stage:
                 validation_stage = stage.get("split") == "validation"

@@ -469,6 +469,101 @@ class DownloadFrameLimitIntegrationTests(PipelineFixture):
                 self.assertAlmostEqual(float(streams["audio"]["duration"]), expected_frames / 25, delta=0.05)
 
 
+class PretrainingPreparationTests(PipelineFixture):
+    def test_positive_count_and_video_only_validation_skip_alignment_dependencies(self):
+        for count in ("0", "-1", "1.5"):
+            with self.subTest(count=count), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.args("--N-pretrain", count)
+        parser = pipeline.build_argparser()
+        args = parser.parse_args([
+            "--N-pretrain", "3", "--prepare-only", "--work-dir", str(self.root),
+            "--group-frames-code", str(self.root / "missing.py"),
+        ])
+        checked = []
+
+        def dependency(name):
+            checked.append(name)
+            return None if name == "faster_whisper" else object()
+
+        with patch.object(pipeline.importlib.util, "find_spec", side_effect=dependency), \
+                patch.object(pipeline, "validate_download_runtimes"), patch.object(pipeline.shutil, "which", return_value="tool"):
+            pipeline.validate_args(parser, args)
+        self.assertNotIn("faster_whisper", checked)
+        self.assertTrue(args.pretrain_visual_encoder)
+        self.assertEqual(args.pretrain_manifest, str(self.root / "pretrain.jsonl"))
+        self.assertEqual(args.max_attempts, 30)
+
+    def test_pretraining_replaces_failed_clips_excludes_validation_and_skips_alignment(self):
+        args = self.args("-N", "2")
+        args.manifest = self.root / "pretrain.jsonl"
+        excluded_clip = pipeline.Clip.from_row(self.row(1))
+        args.validation_manifest = str(self.root / "valid.jsonl")
+        Path(args.validation_manifest).write_text(json.dumps({"video": "heldout.mp4",
+                                                            "source_key": excluded_clip.source_key}) + "\n")
+        attempted = []
+
+        def download(clip, args):
+            attempted.append(clip.url)
+            if clip.url.endswith("test0"):
+                raise RuntimeError("broken clip")
+            path = self.root / f"{clip.key}.mp4"
+            path.write_bytes(b"downloaded fixture")
+            return path
+
+        rows = [self.row(), self.row(1), self.row(2), self.row(2), self.row(3)]
+        with patch.object(pipeline, "iter_metadata", return_value=(row for row in rows)), \
+                patch.object(pipeline, "download_clip", side_effect=download), \
+                patch.object(pipeline, "load_grouper", side_effect=AssertionError("alignment was loaded")), \
+                patch.object(pipeline, "alignment_tokenizer", side_effect=AssertionError("tokenizer was loaded")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            pipeline.prepare(args, video_only=True)
+        records = train.load_manifest(args.manifest, video_only=True)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(set(row) == {"video", "source_key"} for row in records))
+        self.assertEqual(attempted, [pipeline.Clip.from_row(self.row(i)).url for i in (0, 2, 3)])
+        report = pipeline.read_cache(self.root / "pretrain_report.json")
+        self.assertEqual((report["requested"], report["usable"], report["attempts"]), (2, 2, 3))
+        self.assertEqual(report["skipped_excluded_clips"], 1)
+
+    def test_pretraining_shortfall_preserves_previous_manifest(self):
+        args = self.args("-N", "2")
+        args.manifest.write_text("previous manifest\n")
+        video = self.root / "fixture.mp4"
+        video.write_bytes(b"fixture")
+        with patch.object(pipeline, "iter_metadata", return_value=(self.row() for _ in range(1))), \
+                patch.object(pipeline, "download_clip", return_value=video), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "Only 1/2 usable"):
+                pipeline.prepare(args, video_only=True)
+        self.assertEqual(args.manifest.read_text(), "previous manifest\n")
+        self.assertEqual(len(train.load_manifest(str(args.manifest) + ".partial", video_only=True)), 1)
+
+    def test_combined_downloads_forward_pretraining_manifest_and_options(self):
+        preparations, commands = [], []
+
+        def prepare(args, *, video_only=False):
+            preparations.append((args.num_videos, str(args.manifest), video_only))
+
+        def run(command, **kwargs):
+            commands.append(command)
+            if "--prepare-only" in command:
+                pipeline.main(command[2:])
+
+        with patch.object(pipeline.importlib.util, "find_spec", return_value=object()), \
+                patch.object(pipeline, "validate_download_runtimes"), \
+                patch.object(pipeline.shutil, "which", return_value="tool"), \
+                patch.object(pipeline, "prepare", side_effect=prepare), \
+                patch.object(pipeline.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+            pipeline.main(["-N", "2", "--N-pretrain", "5", "--work-dir", str(self.root),
+                           "--pretrain-epochs", "3", "--pretrain-adjacent-frames", "4"])
+        self.assertEqual(preparations, [(2, str(self.root / "data.jsonl"), False),
+                                        (5, str(self.root / "pretrain.jsonl"), True)])
+        forwarded = train.build_argparser().parse_args(commands[-1][2:])
+        self.assertTrue(forwarded.pretrain_visual_encoder)
+        self.assertEqual(forwarded.pretrain_manifest, str(self.root / "pretrain.jsonl"))
+        self.assertEqual((forwarded.pretrain_epochs, forwarded.pretrain_adjacent_frames), (3, 4))
+        self.assertFalse(any(flag.startswith("--N-pretrain") for flag in commands[-1]))
+
+
 @unittest.skipUnless(pipeline.DEFAULT_GROUPER.is_file()
                      and importlib.util.find_spec("faster_whisper"), "local frame grouper is unavailable")
 class GrouperIntegrationTests(PipelineFixture):
