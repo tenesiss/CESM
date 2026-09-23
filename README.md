@@ -257,6 +257,75 @@ These CSV metrics describe the training samples with the true preceding text
 supplied to the model. They are not held-out or free-running transcription
 scores; see the experiment guide for metric definitions.
 
+### Learning curves and streaming accuracy
+
+`train.py`, the variant scripts, and `run_all_variants.py` save
+`CHECKPOINT_STEM.learning.png` and `CHECKPOINT_STEM.learning.csv` beside each
+checkpoint after every epoch. All four curves are enabled by default: training
+loss, validation loss, training accuracy, and validation accuracy. Validation
+curves require `--validation-manifest` (or `--N-valid` in the runner); they are
+omitted when no validation set is supplied.
+
+Disable individual curves with `--no-plot-training-loss`,
+`--no-plot-validation-loss`, `--no-plot-training-accuracy`, or
+`--no-plot-validation-accuracy`. Use `--no-plot-learning-curves` to disable the
+graph and epoch CSV entirely. Disabled accuracy curves skip their decoding pass;
+losses required for validation checkpoint selection are still evaluated. The
+existing final NLL/margin CSVs remain available separately.
+
+```bash
+python3 train.py --manifest training.jsonl --validation-manifest validation.jsonl \
+  --output checkpoints/model.pt --metrics-csv auto \
+  --no-plot-training-accuracy --accuracy-warmup-frames 5 \
+  --accuracy-confidence-threshold 0.8 --accuracy-repeat-token-cooldown-frames 7
+
+python3 run_all_variants.py --manifest training.jsonl --validation-manifest validation.jsonl \
+  --variants 1 5 --run-dir runs/learning_curves \
+  --accuracy-stable-frames 2 --accuracy-min-frames-per-token 3 \
+  --variant-args '5:--no-plot-training-loss --accuracy-repeat-token-cooldown-frames 0'
+```
+
+Accuracy uses the **same cached streaming decoder as `infer.py`**, starting each
+original video with BOS and feeding back only emitted tokens. It does not use
+teacher text or alignment windows, and `--max-frames` does not reset its caches
+or truncate videos. This adds a full streaming pass per enabled split per epoch;
+its caches grow with the decoded video, even when training uses short sections.
+
+The score is `max(0, 1 - total_token_edits / total_reference_tokens)`, aggregated
+over the split. Edits are insertions, deletions, and substitutions, including
+missing output after early EOS or the output limit. BOS, EOS, and padding are
+not scored. Tokens are characters for the default tokenizer and LM tokens for a
+pretrained tokenizer. Empty reference transcripts contribute insertion errors;
+an entirely empty-reference split scores 1 only if no tokens were emitted.
+The CSV stores fractions; the graph shows percentages.
+
+Every inference commit setting is exposed with an `--accuracy-` prefix:
+
+| Parameter | Default |
+| --- | --- |
+| `--accuracy-warmup-frames` | `3` |
+| `--accuracy-confidence-threshold` | `0.75` |
+| `--accuracy-confidence-min-threshold` | `0.45` |
+| `--accuracy-confidence-relax-per-frame` | `0.01` |
+| `--accuracy-confidence-relax-after` | `4` |
+| `--accuracy-stable-frames` | `1` |
+| `--accuracy-min-frames-per-token` | `2` |
+| `--accuracy-repeat-token-cooldown-frames` | `10` (`0` disables) |
+| `--accuracy-min-token-prob` | `0.0` |
+| `--accuracy-token-temperature` | Current `--confidence-token-temperature` |
+| `--accuracy-conf-temperature` | Current `--confidence-temperature` |
+| `--accuracy-max-tokens` | `512` |
+| `--accuracy-flush-tokens` | `0` (frame variants never flush) |
+
+Token and confidence stages have separate graph panels because their objective
+losses differ. Losses use fixed end-of-epoch weights with dropout disabled,
+weighted by supervised positions. Accuracy before confidence training uses an
+uncalibrated confidence head; the epoch CSV marks this with
+`confidence_trained=False`. Each invocation writes its own epoch history,
+including epochs subsequently discarded by best-checkpoint selection; resume
+keeps checkpoint epoch numbers but starts a fresh learning CSV/graph. Matplotlib
+is included in `requirements.txt`; rendering works without a display server.
+
 ### Video projection and frame text contribution
 
 Use `--no-vproj` to pass the video encoder's features directly into fusion.

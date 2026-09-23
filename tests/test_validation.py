@@ -185,6 +185,17 @@ class ValidationTrainingTests(unittest.TestCase):
                 self.assertNotIn("c", saved["tokenizer"]["itos"])  # Vocabulary comes only from training.
                 with Path(args.output).with_suffix(".metrics.csv").open() as stream:
                     self.assertEqual([row["text"] for row in csv.DictReader(stream)], ["ab"])
+                with Path(args.output).with_suffix(".learning.csv").open() as stream:
+                    learning = list(csv.DictReader(stream))
+                self.assertEqual([row["stage"] for row in learning], ["token"] * 3 + ["confidence"] * 2)
+                self.assertEqual([float(row["training_loss"]) for row in learning], [3, 1, 4, 1, 2])
+                self.assertEqual([float(row["validation_loss"]) for row in learning], [3, 2, 3, 1, 2])
+                for row in learning:
+                    for key in ("training_accuracy", "validation_accuracy"):
+                        self.assertTrue(0 <= float(row[key]) <= 1)
+                self.assertEqual(learning[0]["confidence_trained"], "False")
+                self.assertEqual(learning[-1]["confidence_trained"], "True")
+                self.assertTrue(Path(args.output).with_suffix(".learning.png").is_file())
 
     def test_epoch_limit_also_restores_best_without_early_stopping(self):
         args = self.args("--epochs", "2", "--confidence-epochs", "0", "--early-stopping-patience", "0")
@@ -210,6 +221,51 @@ class ValidationTrainingTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     train.train(self.args(*flags))
                 model.assert_not_called()
+
+    def test_disabled_curves_skip_extra_evaluation_and_keep_final_metrics(self):
+        args = self.args("--epochs", "1", "--confidence-epochs", "0", "--validation-manifest", "",
+                         "--no-plot-learning-curves")
+        with patch.object(train, "evaluate_streaming_accuracy") as accuracy, \
+                patch.object(train, "evaluate_loss") as loss, contextlib.redirect_stdout(io.StringIO()):
+            train.train(args)
+        accuracy.assert_not_called()
+        loss.assert_not_called()
+        self.assertFalse(Path(args.output).with_suffix(".learning.csv").exists())
+        self.assertTrue(Path(args.output).with_suffix(".metrics.csv").exists())
+
+    def test_no_validation_creates_training_curves_and_resume_starts_fresh_history(self):
+        args = self.args("--epochs", "1", "--confidence-epochs", "0", "--validation-manifest", "")
+        with contextlib.redirect_stdout(io.StringIO()):
+            train.train(args)
+        with Path(args.output).with_suffix(".learning.csv").open() as stream:
+            records = list(csv.DictReader(stream))
+        self.assertEqual(len(records), 1)
+        self.assertTrue(float(records[0]["training_loss"]) > 0)
+        self.assertEqual((records[0]["validation_loss"], records[0]["validation_accuracy"]), ("", ""))
+        args.resume = args.output
+        args.epochs = 0
+        args.confidence_epochs = 1
+        with contextlib.redirect_stdout(io.StringIO()):
+            train.train(args)
+        with Path(args.output).with_suffix(".learning.csv").open() as stream:
+            records = list(csv.DictReader(stream))
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0]["stage"], records[0]["epoch"]), ("confidence", "1"))
+
+    def test_individual_curve_toggles_skip_training_decoding_but_keep_validation_selection(self):
+        args = self.args("--epochs", "1", "--confidence-epochs", "0",
+                         "--no-plot-training-accuracy", "--no-plot-validation-loss")
+        with patch.object(train, "evaluate_streaming_accuracy", wraps=train.evaluate_streaming_accuracy) as accuracy, \
+                patch.object(train, "evaluate_loss", wraps=train.evaluate_loss) as loss, \
+                contextlib.redirect_stdout(io.StringIO()):
+            train.train(args)
+        self.assertEqual(accuracy.call_count, 1)
+        self.assertEqual(accuracy.call_args.args[1].rows[0]["text"], "ac")
+        self.assertEqual(loss.call_count, 2)  # Both losses are still needed for checkpoint selection.
+        with Path(args.output).with_suffix(".learning.csv").open() as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual((row["training_accuracy"], row["validation_loss"]), ("", ""))
+        self.assertTrue(0 <= float(row["validation_accuracy"]) <= 1)
 
 
 if __name__ == "__main__":

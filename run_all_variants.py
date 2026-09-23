@@ -48,7 +48,9 @@ def training_actions():
 def copy_option(parser, action, *, default=argparse.SUPPRESS):
     """Copy the simple store/boolean/append options used by the existing CLIs."""
     options = dict(dest=action.dest, default=default, help=action.help)
-    if isinstance(action, argparse._StoreTrueAction):
+    if isinstance(action, argparse.BooleanOptionalAction):
+        options["action"] = argparse.BooleanOptionalAction
+    elif isinstance(action, argparse._StoreTrueAction):
         options["action"] = "store_true"
     elif isinstance(action, argparse._StoreFalseAction):
         options["action"] = "store_false"
@@ -59,7 +61,10 @@ def copy_option(parser, action, *, default=argparse.SUPPRESS):
             value = getattr(action, key)
             if value is not None:
                 options[key] = value
-    parser.add_argument(*action.option_strings, **options)
+    flags = action.option_strings
+    if isinstance(action, argparse.BooleanOptionalAction):
+        flags = [flag for flag in flags if not flag.startswith("--no-")]
+    parser.add_argument(*flags, **options)
 
 
 def build_argparser():
@@ -101,6 +106,8 @@ def build_argparser():
 
 
 def option_tokens(action, value):
+    if isinstance(action, argparse.BooleanOptionalAction):
+        return [] if value is None else [action.option_strings[0 if value else 1]]
     if isinstance(action, argparse._StoreTrueAction):
         return [action.option_strings[0]] if value else []
     if isinstance(action, argparse._StoreFalseAction):
@@ -140,6 +147,7 @@ def variant_overrides(parser, specifications):
 def validate_training_args(parser, args):
     try:
         train.validate_early_stopping_args(args)
+        train.accuracy_decode_args(args)
     except ValueError as exc:
         parser.error(str(exc))
     if args.epochs <= 0 or args.confidence_epochs < 0:
@@ -214,7 +222,14 @@ def build_commands(parser, args, run_dir):
             flags.append(f"--validation-manifest={run_dir / 'validation_samples.jsonl'}")
         parsed = module.build_argparser().parse_args(flags)
         validate_training_args(parser, parsed)
-        stages.append({"name": f"train_{index}", "command": [sys.executable, module.__file__, *flags]})
+        training_stage = {"name": f"train_{index}", "command": [sys.executable, module.__file__, *flags]}
+        if parsed.plot_learning_curves and any(
+            getattr(parsed, "plot_" + curve) and (not curve.startswith("validation_") or parsed.validation_manifest)
+            for curve in ("training_loss", "validation_loss", "training_accuracy", "validation_accuracy")
+        ):
+            training_stage.update(learning_plot=str(checkpoint.with_suffix(".learning.png")),
+                                  learning_csv=str(checkpoint.with_suffix(".learning.csv")))
+        stages.append(training_stage)
         metrics_csv = checkpoint.with_suffix(".metrics.csv")
         command = [sys.executable, str(ROOT / "tests" / "evaluate_checkpoints.py"),
                    "--manifest", str(snapshot), "--checkpoints", str(checkpoint),

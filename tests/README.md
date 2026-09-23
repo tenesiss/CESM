@@ -198,7 +198,10 @@ The best prediction weights are restored before confidence training. Confidence
 training freezes that prediction path and selects its own best checkpoint with a
 fresh patience counter. The best weights are restored even when the epoch limit
 is reached. Loss evaluation adds a full training-set and validation-set pass per
-epoch. Without a validation manifest, the existing fixed-epoch training is unchanged.
+epoch. Without a validation manifest, training runs its fixed epoch count.
+Learning curves add end-of-epoch loss and streaming accuracy evaluation by default;
+see [learning curves and decoder flags](../README.md#learning-curves-and-streaming-accuracy)
+for all four curve toggles, inference settings, output paths, and score definitions.
 
 Each final checkpoint records `validation_selection` with the best epoch, training
 loss, validation loss, combined score, full epoch history, and stopping status for

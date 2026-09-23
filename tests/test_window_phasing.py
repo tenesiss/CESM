@@ -164,6 +164,7 @@ class WindowPhasingTests(unittest.TestCase):
             args = train.build_argparser().parse_args([
                 '--manifest', str(manifest), '--output', str(checkpoint), '--device', 'cpu',
                 '--epochs', '1', '--confidence-epochs', '0', '--batch-size', '1', '--log-every', '0',
+                '--no-plot-learning-curves',  # This loss-only fixture mocks decoded video tensors.
                 '--no-face-detector', '--mouth-size', '16', '--conv3d-channels', '8',
                 '--d-video', '8', '--d-text', '8', '--d-fusion', '8', '--heads', '2',
                 '--video-layers', '1', '--text-layers', '1', '--ff-mult', '1', '--dropout', '0',

@@ -67,6 +67,10 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.checkpoint import checkpoint
 
 from flash_mono import attention_statistics_from_qk
+from learning_curves import (
+    LearningCurveLogger, accuracy_decode_args, add_learning_curve_arguments, token_edit_distance,
+)
+from streaming import decode_stream
 
 
 # -----------------------------------------------------------------------------
@@ -2801,6 +2805,52 @@ def restore_checkpoint_weights(model, path):
     model.load_state_dict(saved["model_state"], strict=True)
 
 
+def evaluate_streaming_accuracy(model, dataset, device, args) -> float:
+    """Corpus token edit accuracy from full-video, free-running causal decoding.
+
+    No teacher prefixes, alignment windows, section resets, or padding enter this
+    metric. Insertions, deletions and substitutions all count as errors. Clamp
+    once after summing edits/reference lengths over the entire split.
+    """
+    options = accuracy_decode_args(args)
+    modes = [(module, module.training) for module in model.modules()]
+    model.eval()
+    edits = reference_count = 0
+    try:
+        for row in dataset.rows:
+            capture = cv2.VideoCapture(row["video"])
+            try:
+                if not capture.isOpened():
+                    raise RuntimeError(f"Could not open video: {row['video']}")
+                cropper = FixedMouthCropper(dataset.mouth_size, dataset.use_face_detector)
+
+                def frames():
+                    while True:
+                        ok, frame = capture.read()
+                        if not ok:
+                            return
+                        yield cropper(frame)
+
+                prediction, count = decode_stream(
+                    model, dataset.tokenizer, frames(), device, options,
+                    token_temperature=options.token_temperature,
+                    conf_temperature=options.conf_temperature, amp=args.amp,
+                )
+                if count == 0:
+                    raise RuntimeError(f"No frames decoded from video: {row['video']}")
+            finally:
+                capture.release()
+            reference = dataset.tokenizer.encode(row["text"])
+            edits += token_edit_distance(reference, prediction)
+            reference_count += len(reference)
+    finally:
+        for module, mode in modes:
+            module.training = mode
+    if not reference_count:
+        return float(edits == 0)
+    return max(0.0, 1.0 - edits / reference_count)
+
+
 def _confidence_modules(model: UnnobaModel) -> List[nn.Module]:
     m = model.mixed
     modules = [
@@ -2843,6 +2893,7 @@ def configure_token_stage(model: UnnobaModel) -> List[nn.Parameter]:
 
 def train(args) -> None:
     validate_early_stopping_args(args)
+    accuracy_decode_args(args)
     metrics_path = None
     if args.metrics_csv:
         metrics_path = str(Path(args.output).with_suffix(".metrics.csv")) if args.metrics_csv == "auto" else args.metrics_csv
@@ -2878,6 +2929,15 @@ def train(args) -> None:
         raise ValueError("--confidence-future-weight-decay must be >= 0")
     if args.confidence_token_temperature <= 0 or args.confidence_temperature <= 0:
         raise ValueError("confidence temperatures must be > 0")
+
+    curves = LearningCurveLogger(args)
+    if curves.selected:
+        protected = {Path(path).resolve() for path in
+                     (args.output, args.manifest, args.validation_manifest, args.resume, metrics_path) if path}
+        if protected & {curves.csv_path.resolve(), curves.plot_path.resolve()}:
+            raise ValueError("Learning-curve output paths must differ from checkpoints, manifests and --metrics-csv")
+        print(f"learning curves enabled: {', '.join(curves.selected)}; "
+              "streaming accuracy evaluates complete videos after each epoch")
 
     seed_everything(args.seed)
     rows = load_manifest(args.manifest)
@@ -2992,23 +3052,41 @@ def train(args) -> None:
     )
     validation_selection = {}
     token_monitor = confidence_monitor = None
+    validation_ds = None
+    def loss_loader(dataset):
+        return DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
+                          num_workers=args.workers, collate_fn=make_collate(tokenizer.pad_id),
+                          pin_memory=device.type == "cuda",
+                          generator=torch.Generator().manual_seed(args.seed))
+    if validation_rows is not None or curves.selected:
+        training_loss_loader = loss_loader(ds)
     if validation_rows is not None:
         validation_ds = VideoTextWindowDataset(
             validation_rows, tokenizer, cfg.mouth_size, use_face_detector=not args.no_face_detector,
             max_frames=args.max_frames, video_dtype=ds.video_dtype,
             window_phasing=args.window_phasing,
         )
-        def loss_loader(dataset):
-            return DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.workers, collate_fn=make_collate(tokenizer.pad_id),
-                              pin_memory=device.type == "cuda",
-                              generator=torch.Generator().manual_seed(args.seed))
-        training_loss_loader = loss_loader(ds)
         validation_loader = loss_loader(validation_ds)
         token_monitor = ValidationMonitor(args.early_stopping_patience, args.early_stopping_min_delta)
         confidence_monitor = ValidationMonitor(args.early_stopping_patience, args.early_stopping_min_delta)
         print(f"validation videos={len(validation_rows)}; select lowest (training_loss + validation_loss) / 2; "
               f"validation patience={args.early_stopping_patience}")
+
+    def record_learning_epoch(stage, epoch, confidence_trained, training_loss=None, validation_loss=None):
+        if not curves.selected:
+            return
+        values = dict(training_loss=training_loss, validation_loss=validation_loss)
+        for split, dataset in (("training", ds), ("validation", validation_ds)):
+            if dataset is None:
+                continue
+            loss_key, accuracy_key = f"{split}_loss", f"{split}_accuracy"
+            if loss_key in curves.selected and values[loss_key] is None:
+                evaluation_loader = training_loss_loader if split == "training" else validation_loader
+                values[loss_key] = evaluate_loss(model, evaluation_loader, device, args, stage=stage)
+            if accuracy_key in curves.selected:
+                values[accuracy_key] = evaluate_streaming_accuracy(model, dataset, device, args)
+        curves.record(stage, epoch, confidence_trained, **values)
+        print("learning curves: " + " ".join(f"{key}={values[key]:.6f}" for key in curves.selected))
 
     model = UnnobaModel(
         cfg,
@@ -3126,15 +3204,18 @@ def train(args) -> None:
             if n == 0:
                 raise ValueError("No supervised positions were available for token/frame training")
             improved = True
-            if token_monitor is not None:
+            training_loss = validation_loss = None
+            if token_monitor is not None or curves.selected:
                 out = losses = None
                 opt.zero_grad(set_to_none=True)
+            if token_monitor is not None:
                 training_loss = evaluate_loss(model, training_loss_loader, device, args)
                 validation_loss = evaluate_loss(model, validation_loader, device, args)
                 improved = token_monitor.update(epoch, training_loss, validation_loss)
                 validation_selection["token"] = token_monitor.state_dict()
                 print(f"token epoch={epoch} training_loss={training_loss:.6f} "
                       f"validation_loss={validation_loss:.6f} joint_loss={(training_loss + validation_loss) / 2:.6f}")
+            record_learning_epoch("token", epoch, confidence_already_trained, training_loss, validation_loss)
             if improved:
                 save_checkpoint(
                     args.output, model, tokenizer, args, epoch, stage="token",
@@ -3221,17 +3302,21 @@ def train(args) -> None:
                 f"loss={total_loss/max(1,n):.4f} mean_s={total_mean_target/max(1,n):.4f}"
             )
             improved = True
-            if confidence_monitor is not None:
+            training_loss = validation_loss = None
+            if confidence_monitor is not None or curves.selected:
                 if n == 0:
                     raise ValueError("No supervised positions were available for confidence training")
                 conf_loss = conf_stats = None
                 conf_opt.zero_grad(set_to_none=True)
+            if confidence_monitor is not None:
                 training_loss = evaluate_loss(model, training_loss_loader, device, args, stage="confidence")
                 validation_loss = evaluate_loss(model, validation_loader, device, args, stage="confidence")
                 improved = confidence_monitor.update(conf_epoch, training_loss, validation_loss)
                 validation_selection["confidence"] = confidence_monitor.state_dict()
                 print(f"confidence epoch={conf_epoch} training_loss={training_loss:.6f} "
                       f"validation_loss={validation_loss:.6f} joint_loss={(training_loss + validation_loss) / 2:.6f}")
+            record_learning_epoch("confidence", conf_epoch, confidence_already_trained or n > 0,
+                                  training_loss, validation_loss)
             if improved:
                 save_checkpoint(
                     args.output, model, tokenizer, args, final_token_epoch,
@@ -3251,6 +3336,8 @@ def train(args) -> None:
             print(f"Restored best confidence checkpoint: epoch={confidence_monitor.best['epoch']}")
 
 
+    if curves.history:
+        print(f"saved learning curves: {curves.plot_path}; epoch metrics: {curves.csv_path}")
     if metrics_path is not None:
         rows = evaluate_samples(
             model, ds, device=device, batch_size=args.batch_size, workers=args.workers,
@@ -3279,6 +3366,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--metrics-include-eos", action="store_true",
                    help="Include EOS in token-level CSV means (default: transcript tokens only)")
     p.add_argument("--variant-name", default=None, help="Experiment label in the metrics CSV")
+    add_learning_curve_arguments(p)
     p.add_argument("--resume", default=None,
                    help="Optional compatible checkpoint. Add --confidence-only to skip token training.")
     p.add_argument(

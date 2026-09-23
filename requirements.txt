@@ -3,3 +3,4 @@ opencv-python>=4.8,<5
 torch>=2.3
 transformers>=4.45,<6
 tokenizers>=0.20
+matplotlib>=3.6

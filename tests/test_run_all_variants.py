@@ -430,6 +430,17 @@ class AllVariantRunnerTests(unittest.TestCase):
         self.assertEqual({str(path) for path in (run_dir / "checkpoints").glob("*.pt")},
                          set(report["checkpoints"]))
         for index, checkpoint in zip(selected, report["checkpoints"]):
+            training_stage = next(s for s in report["stages"] if s["name"] == f"train_{index}")
+            self.assertTrue(Path(training_stage["learning_plot"]).is_file())
+            with Path(training_stage["learning_csv"]).open(newline="") as stream:
+                learning = list(csv.DictReader(stream))
+            self.assertEqual([row["stage"] for row in learning], ["token", "confidence"])
+            for row in learning:
+                self.assertTrue(np.isfinite(float(row["training_loss"])))
+                self.assertTrue(0 <= float(row["training_accuracy"]) <= 1)
+                if validation:
+                    self.assertTrue(np.isfinite(float(row["validation_loss"])))
+                    self.assertTrue(0 <= float(row["validation_accuracy"]) <= 1)
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
             self.assertEqual(saved["training_args"]["manifest"], report["samples"]["manifest"])
             self.assertEqual(saved["training_stage"], "confidence")

@@ -897,7 +897,10 @@ def training_command(args):
         if action.dest == "help":
             continue
         value = getattr(args, action.dest)
-        if isinstance(action, argparse._StoreTrueAction):
+        if isinstance(action, argparse.BooleanOptionalAction):
+            if value is not None:
+                command.append(action.option_strings[0 if value else 1])
+        elif isinstance(action, argparse._StoreTrueAction):
             if value:
                 command.append(action.option_strings[0])
         elif value is not None:

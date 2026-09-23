@@ -9,6 +9,8 @@
 !train_mathematics.tex
 !model_architecture.tex
 !infer.py
+!streaming.py
+!learning_curves.py
 !run_all_variants.py
 !grouper.py
 !train_talkvid.py
@@ -26,3 +28,4 @@
 !tests/test_fusion_options.py
 !tests/test_window_phasing.py
 !tests/test_infer_cooldown.py
+!tests/test_learning_curves.py
