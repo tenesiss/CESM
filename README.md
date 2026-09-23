@@ -4,6 +4,8 @@ CESM is a research prototype for learning to transcribe speech from video of a
 speaker's mouth. It pairs a causal video encoder with a text encoder, predicts
 the next token from the available video and text history, and learns a per-frame
 confidence signal to decide when to emit that token during streaming inference.
+The model consumes video and text history; audio is used only when preparing
+transcripts and alignments with the optional ASR pipeline.
 
 The repository supports training on your own aligned videos or preparing clips
 from TalkVid or HDTF, experimenting with five fusion/loss variants, and running cached
@@ -31,9 +33,9 @@ frames and text states are available to each prediction.
 
 Training has two stages:
 
-1. Train token prediction (or frame prediction in variant 5) with configurable
-   projection and attention regularizers. Only projection norm penalties have
-   nonzero regularization weights by default.
+1. Train token prediction per aligned window (or per labeled frame in variant 5)
+   with configurable projection and attention regularizers. Only projection norm
+   penalties have nonzero regularization weights in the base trainer by default.
 2. Freeze the token prediction path and train confidence from the predictor's
    normalized entropy and future-distribution instability.
 
@@ -49,12 +51,27 @@ keep their PDFs together to use the companion-document links.
 
 ## Getting started
 
-Run these commands from the repository root in your Python environment. Install
-the core training and inference dependencies:
+Run these commands from the repository root. If you do not already have a Python
+environment, create and activate one first (Linux/macOS):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+On Windows PowerShell, use `python -m venv .venv` and
+`.venv\Scripts\Activate.ps1`, then use `python` in place of `python3` below.
+Install the core training and inference dependencies:
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
+
+The core requirements include PyTorch, NumPy, OpenCV 4.x, Hugging Face
+Transformers/tokenizers, and Matplotlib. Dataset downloading and ASR additionally
+need [`requirements-downvid.txt`](requirements-downvid.txt) and the external
+tools described in [dataset setup](#download-videos-and-train).
+`requirements-talkvid.txt` is a compatibility alias for those pipeline requirements.
 
 For an existing [aligned dataset](#data-and-alignment), train the default
 character-level model and save its checkpoint:
@@ -75,6 +92,10 @@ The trainer selects CUDA when available and otherwise uses CPU; `--device`
 overrides that choice. On CUDA, add `--amp` to enable mixed precision.
 `--max-frames` bounds the video section size used during training; its
 [sectioning semantics](#video-sectioning) preserve transcript context.
+Learning curves are enabled by default and add full-video streaming evaluation
+after each supervised epoch. To reduce this cost, use
+`--no-plot-training-accuracy --no-plot-validation-accuracy`; see
+[learning curves](#learning-curves-and-streaming-accuracy) for the remaining controls.
 
 Transcribe a video with the trained checkpoint:
 
@@ -88,10 +109,13 @@ Inference reads a video file incrementally and emits text as tokens are
 committed. Add `--json-events` for structured events or `--pace-realtime` to pace
 processing to the source frame rate when inference is faster than playback.
 Use `python3 train.py --help` and `python3 infer.py --help` for all CLI options.
+Example dataset and checkpoint paths are placeholders; supply your own aligned
+data and train a checkpoint before inference.
 
 ## Data and alignment
 
-Training takes a JSONL manifest with one example per line:
+Training takes a UTF-8 JSONL manifest with one example per line (blank lines are
+ignored):
 
 ```json
 {"video":"clips/hello.mp4","text":"hello","windows":[[0,3],[4,6],[7,9],[10,12],[13,16]]}
@@ -100,8 +124,17 @@ Training takes a JSONL manifest with one example per line:
 Each row supplies a video path, its transcript, and inclusive, zero-based
 `[start_frame, end_frame]` windows. Relative video paths resolve from the
 manifest's directory. With the default character tokenizer, `windows[i]` aligns
-the Unicode character `text[i]` to its frames. Windows must be ordered and
-non-overlapping; gaps between them are allowed.
+the Unicode character `text[i]` to its frames, including spaces and punctuation.
+Windows must be ordered and non-overlapping; gaps between them are allowed.
+Every window must have `0 <= start_frame <= end_frame < decoded_frame_count`.
+Do not add windows for BOS, EOS, or padding; the trainer supplies special tokens.
+Frame indices refer to the exact saved clip, so trimming or resampling a video
+requires updating its alignments. For example, `clips/hello.mp4` in
+`data/train.jsonl` refers to `data/clips/hello.mp4`.
+
+The character vocabulary is built from the training transcripts. Validation and
+inference reuse it; previously unseen characters map to the unknown token.
+An optional `"window_unit":"character"` makes the alignment unit explicit.
 
 ### Pretrained token alignment
 
@@ -117,6 +150,39 @@ are also accepted when their window count differs from the source-text length.
 If the token and character counts happen to be equal, set
 `"window_unit":"token"` on the row to remove the ambiguity. Use exactly the
 same tokenizer/model named by `--pretrained-lm` when creating such alignments.
+
+### Video preprocessing
+
+The first decoded frame determines a fixed mouth rectangle for the entire video.
+The default uses the lower-central part of the largest Haar-detected face; if
+no face is found, it falls back to a lower-center crop of the frame. Detection
+is not retried and the crop does not track later head motion or scene changes.
+`--no-face-detector` always selects the fallback crop.
+
+Crops are resized to `--mouth-size` (default: `96` pixels square), converted to
+RGB, and normalized to `[-1,1]`. Use clips with one visible speaker whose mouth
+stays inside that fixed region. Training and inference read the original video;
+the frame images generated during alignment are preprocessing artifacts.
+Inference restores the checkpoint's crop size and face-detector setting, with
+`--no-face-detector` available as an override.
+
+### Separate validation data
+
+The base trainer and individual variant scripts accept a validation manifest:
+
+```bash
+python3 train.py --manifest data/train.jsonl \
+  --validation-manifest data/validation.jsonl --max-frames 256 \
+  --early-stopping-patience 5 --output checkpoints/cesm.pt
+```
+
+Training and validation must use separate videos. The loader rejects shared
+resolved video paths and matching nonempty `source_key` values. Set the same
+`source_key` on all clips from one source upload when preparing your own data;
+without it, distinct clips from that upload cannot be detected as overlapping.
+The downloader records these keys automatically. See
+[validation and checkpoint selection](#architecture-experiments) for the combined
+training/validation selection criterion and per-stage early stopping.
 
 ## Visual encoder pretraining
 
@@ -219,6 +285,10 @@ network resolution.
 
 ## Checkpoints and inference
 
+Every checkpoint stores model weights/configuration, the tokenizer, crop
+settings, section size, training arguments, stage/epoch counts, and confidence
+metadata. With validation enabled, it also records checkpoint selection history.
+
 When using a pretrained text encoder, CESM checkpoints include:
 
 - the imported LM weights as part of `model_state`;
@@ -245,22 +315,57 @@ frames pass since the previous commit, subject to a threshold floor, warmup,
 minimum frame gap, and optional token-probability and stability guards. A
 confidence-trained checkpoint is needed for meaningful commit timing; confidence
 targets measure entropy and future instability rather than explicit boundaries.
+While a candidate remains unchanged, the decoder keeps its peak confidence, so
+a later relaxed threshold can accept that earlier peak. Inference uses the
+confidence-training temperatures stored in the checkpoint unless overridden by
+`--token-temperature` or `--conf-temperature`.
 
 `--repeat-token-cooldown-frames N` requires at least `N` frames since the same
-token ID was last emitted (default: `5`; `0` disables the guard). For example,
-with `N=5`, a token emitted at frame 10 can be emitted again starting at frame 15,
+token ID was last emitted (default: `10`; `0` disables the guard). For example,
+with `N=10`, a token emitted at frame 10 can be emitted again starting at frame 20,
 even if other tokens were emitted in between. Earlier predictions of that token
 are skipped without selecting a runner-up or accumulating confidence/stability;
 video processing continues. The optional `--flush-tokens` pass also respects this
 cooldown and stops when its next token is blocked, since no more frames can pass.
 
+Decoding stops at EOS, end of video, or `--max-tokens` (default: `512`).
+`--flush-tokens N` optionally adds up to N greedy tokens from the final video
+cache, bypassing confidence; it defaults to `0` and is disabled for frame fusion.
+Streaming caches grow with the video and emitted text; the checkpoint's training
+`--max-frames` does not bound inference memory.
+
+`--json-events` writes JSONL to stdout: a `start` event, committed `token` events,
+optional `eos`/`flush_token` events, and a final `done` event containing the decoded
+transcript and timing. Diagnostics go to stderr. Use the final `done.text` for
+the complete transcript, especially with tokenizers whose Unicode characters
+span several token IDs. The [decoder defaults](#learning-curves-and-streaming-accuracy)
+below also apply to inference after removing the `accuracy-` prefix; warmup is
+four frames and the repeat-token cooldown is ten frames.
+
 ### Resume training
 
-Resume training with `--resume`. For a pretrained-LM checkpoint, the
-stored architecture and tokenizer are authoritative, so `--pretrained-lm` may
-be omitted; if supplied, its name must match the checkpoint. A checkpoint that
+```bash
+python3 train.py --manifest data/train.jsonl --resume checkpoints/cesm.pt \
+  --epochs 10 --confidence-epochs 5 --max-frames 256 \
+  --output checkpoints/cesm-resumed.pt
+```
+
+Epoch counts request **additional** epochs, not a target lifetime total.
+Resume restores model weights, architecture, tokenizer, and epoch counters; it
+creates fresh optimizers and does not restore optimizer, gradient-scaler, or RNG
+state. Training options come from the current command, so repeat customized
+learning rates, loss weights, `--amp`, `--max-frames`, and `--no-face-detector`
+settings as needed. Supply `--output` explicitly; it does not default to the
+resume path. For a character checkpoint, the new training manifest must produce
+exactly the same character vocabulary.
+
+For a pretrained-LM checkpoint, the stored architecture and tokenizer are
+authoritative, so `--pretrained-lm` may be omitted; if supplied, its name must
+match the checkpoint. A checkpoint that
 previously kept the LM frozen can be resumed with `--fine-tune-pretrained-lm`
 to unfreeze it for the new token-training stage.
+Further token training or visual pretraining resets the saved confidence-trained
+status and confidence epoch count; train confidence again for the updated predictor.
 
 ### Train only confidence
 
@@ -327,23 +432,38 @@ reuse a separate validation dataset, or `--early-stopping-patience 0` to run all
 epochs while still restoring the best checkpoint. Without a validation dataset,
 training keeps its previous fixed-epoch behavior.
 
-FFmpeg (`ffmpeg` and `ffprobe`) and a supported yt-dlp JavaScript runtime must be
-available as described in [dataset setup](#download-videos-and-train). Each variant
-is evaluated as soon as its training finishes, saving a CSV beside its checkpoint and updating
+Download mode requires FFmpeg (`ffmpeg` and `ffprobe`); TalkVid also needs a
+supported yt-dlp JavaScript runtime, as described in
+[dataset setup](#download-videos-and-train). Reusing `--manifest` skips downloading
+and ASR. Each variant is evaluated as soon as its training finishes, saving a CSV
+beside its checkpoint and updating
 `runs/talkvid_comparison/all_variants.csv` before the next variant starts.
 See the [all-in-one runner instructions](tests/README.md#all-in-one-download-train-and-evaluate)
 for per-variant overrides and reusing an existing manifest.
 
-These CSV metrics describe the training samples with the true preceding text
-supplied to the model. They are not held-out or free-running transcription
-scores; see the experiment guide for metric definitions.
+These CSV metrics use the true preceding text supplied to the model. Training
+and validation CSVs describe their respective splits; neither measures
+free-running transcription. See the experiment guide for metric definitions.
+To evaluate saved checkpoints on another aligned manifest without retraining:
+
+```bash
+python3 tests/evaluate_checkpoints.py --manifest data/test.jsonl \
+  --checkpoints checkpoints/cesm.pt --output results/test.metrics.csv
+```
+
+The evaluator restores each checkpoint's tokenizer, preprocessing, AMP setting,
+and section size. `--max-frames`, `--amp`/`--no-amp`, and `--no-face-detector`
+override the corresponding saved settings. `--metrics-csv auto` enables the same
+per-sample metrics after training with the base `train.py`.
 
 ### Learning curves and streaming accuracy
 
 `train.py`, the variant scripts, and `run_all_variants.py` save
 `CHECKPOINT_STEM.learning.png` and `CHECKPOINT_STEM.learning.csv` beside each
-checkpoint after every epoch. All four curves are enabled by default: training
-loss, validation loss, training accuracy, and validation accuracy. Validation
+checkpoint after every token/confidence epoch. Visual pretraining reports its
+MSE losses in the console and is not included in these curves.
+All four curves are enabled by default: training loss, validation loss, training
+accuracy, and validation accuracy. Validation
 curves require `--validation-manifest` (or `--N-valid` in the runner); they are
 omitted when no validation set is supplied.
 
@@ -384,7 +504,7 @@ Every inference commit setting is exposed with an `--accuracy-` prefix:
 
 | Parameter | Default |
 | --- | --- |
-| `--accuracy-warmup-frames` | `3` |
+| `--accuracy-warmup-frames` | `4` |
 | `--accuracy-confidence-threshold` | `0.75` |
 | `--accuracy-confidence-min-threshold` | `0.45` |
 | `--accuracy-confidence-relax-per-frame` | `0.01` |
@@ -568,12 +688,15 @@ to select a runtime outside PATH. Authentication can be supplied using
 | --- | --- |
 | `--dataset talkvid` / `--dataset hdtf` | Select the source; TalkVid remains the default. |
 | `--hdtf-archive PATH_OR_URL` | HDTF MP4 ZIP; defaults to the hosted `videos.zip`. |
-| `--num-videos N` / `-N N` | Required number of successfully downloaded and aligned clips. |
+| `--num-videos N` / `-N N` | Number of successfully downloaded and aligned training clips; required except for login/logout or pretraining-only preparation. |
+| `--N-pretrain N` | Download N unannotated videos independently of `-N` and enable visual pretraining. |
+| `--pretrain-manifest PATH` | Reuse pretraining videos, or choose their output manifest with `--N-pretrain`. |
 | `--prepare-only` | Create the dataset without launching training. |
 | `--metadata PATH_OR_URL` | TalkVid: override metadata with a JSON array or JSONL file/URL. |
 | `--dataset-language English` | Filter metadata by language name; repeat to include several languages. |
 | `--start-index N` | Skip N TalkVid metadata rows or N HDTF videos in filename order. |
-| `--max-attempts N` | Limit eligible, distinct clips attempted; default is 10 times the requested count. |
+| `--exclude-manifest PATH` | Exclude matching video paths and known source uploads during preparation. |
+| `--max-attempts N` | Limit eligible, distinct clips attempted per preparation pass; default is `10 * max(N, N-pretrain)`. |
 | `--whisper-model small` | faster-whisper model name, size, or local directory. |
 | `--language en` | Force the ASR language; omitted by default for automatic detection. |
 | `--whisper-device cpu` | ASR device, independent of the trainer's `--device`. |
@@ -588,6 +711,10 @@ to select a runtime outside PATH. Authentication can be supplied using
 | `--download-timeout 600` / `--download-retries 3` | Per-clip timeout in seconds and downloader retries. |
 | `--image-ext jpg` / `--jpeg-quality 95` | Settings for the grouper's saved frame images. |
 | `--reprocess` | Recompute frame alignments while reusing completed downloads. |
+
+`--N-valid` belongs to `run_all_variants.py`. For the standalone downloader,
+prepare validation separately with `--exclude-manifest data/train.jsonl`, then
+pass the result to training with `--validation-manifest`.
 
 ### Downloads and caching
 
@@ -633,6 +760,11 @@ recognized setup errors stop the run so you can correct them instead of spending
 the entire attempt budget.
 
 ### Alignment and ASR
+
+Prepared transcripts are ASR-generated labels. The grouper uses Whisper word
+timestamps and interpolates character/token boundaries within words; these are
+approximate alignments, not manually verified speech boundaries. Inspect the
+transcripts and grouped frames when diagnosing poor training results.
 
 Alignment automatically follows the training tokenizer: one Unicode character
 per group for the default learned encoder, or the exact fast tokenizer from
@@ -746,8 +878,9 @@ python3 train.py --manifest data/train.jsonl --max-frames 256 --batch-size 2
 
 Each section is an independent batch element in both training stages, so
 `--batch-size` still limits the number of elements and padded videos never
-exceed `N` frames. Tokenization happens before splitting. Each token belongs to
-the section containing its window's final frame; windows crossing a boundary
+exceed `N` frames. Tokenization happens before splitting. For token-query
+variants 1–4, each token belongs to the section containing its window's final
+frame; windows crossing a boundary
 are clipped at that section's start and all windows are shifted to local frame
 indices. Section boundaries do not add BOS or EOS targets. Each section encodes
 the original transcript prefix (including its one original BOS), and predicts
@@ -756,11 +889,16 @@ preceding text state. Prior tokens provide context without being trained again
 as targets. EOS is trained only at the original video's final frame, including
 when that final section contains only trailing silence.
 
-Interior sections without completed tokens have no token targets; batches
+For these variants, interior sections without completed tokens have no token targets; batches
 containing only those sections are skipped. Confidence and attention alignment
 use every real token window, including the last token of a non-final section,
 and exclude the true terminal EOS. Confidence can see prior transcript states
 and only sees each new token starting on the frame after that token's window.
+
+For frame fusion (variant 5), every labeled frame remains supervised, including
+both sides of a token window that crosses a section boundary. A section without
+a completed token can therefore still have frame targets. No artificial EOS
+frame is added.
 
 Video context still resets at each section. Text context is recomputed from the
 full causal prefix, so text-encoder memory and work grow with transcript length;
@@ -815,6 +953,12 @@ paths and compute complexity are unchanged. The flag is a training option with
 no checkpoint architecture changes; specify it again when resuming training.
 
 ## Troubleshooting
+
+### Face detector unavailable
+
+If OpenCV lacks `CascadeClassifier`, install the pinned OpenCV 4.x dependency
+from `requirements.txt`. `--no-face-detector` uses the deterministic fallback
+crop. Repeat the same crop choice when resuming training.
 
 ### FFmpeg frame-limit compatibility
 
@@ -890,26 +1034,39 @@ YouTube authentication and does not explain these player errors.
 | --- | --- |
 | [`train.py`](train.py) | Shared model, tokenization, dataset loading, training stages, and per-sample metrics. |
 | [`infer.py`](infer.py) | Cached, incremental inference and confidence-based token commitment. |
+| [`streaming.py`](streaming.py) | Decoder and commit options shared by inference and streaming accuracy. |
+| [`learning_curves.py`](learning_curves.py) | Per-epoch loss/accuracy CSVs, plots, and decoder-option routing. |
 | [`train_downvid.py`](train_downvid.py) | TalkVid/HDTF download, alignment, caching, and training wrapper. |
+| [`train_talkvid.py`](train_talkvid.py) | Compatibility entry point for `train_downvid.py`. |
+| [`hdtf_download.py`](hdtf_download.py) | Local/HTTP-range ZIP access and HDTF member extraction. |
 | [`grouper.py`](grouper.py) | Speech transcription and grouping frames by character or LM token. |
 | [`run_all_variants.py`](run_all_variants.py) | Shared-dataset orchestration for the five experiments. |
 | [`flash_mono.py`](flash_mono.py) | Streamed monotonic and aligned-window attention statistics. |
 | [`tests/`](tests/README.md) | Variant entry points, experiment reference, and regression checks. |
+| [`tests/evaluate_checkpoints.py`](tests/evaluate_checkpoints.py) | Per-sample metrics for saved checkpoints on an aligned manifest. |
 | [`model_architecture.tex`](model_architecture.tex) | Model blocks, tensor shapes, fusion routes, and streaming execution order. |
 | [`train_mathematics.tex`](train_mathematics.tex) | Alignment, prediction equations, losses, and two-stage training procedure. |
 
 ### Regression checks
 
-Run the available offline pipeline regression checks from the repository root:
+Install `requirements-downvid.txt` to include the grouping dependencies, then
+run the regression suite from the repository root:
 
 ```bash
-python3 -m unittest discover -s tests -p test_download_recovery.py -v
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The checks cover download recovery and frame limits, plus grouping integration
-with fixed ASR timestamps. Runner checks, including a tiny CPU training and
-evaluation integration, are in `tests/test_run_all_variants.py`; the evaluation
-integration also requires the missing `tests/evaluate_checkpoints.py` noted above:
+Tests cover download recovery/caching, HDTF archive access, alignment, variant
+routing, validation and early stopping, visual pretraining, streaming decoding,
+and learning curves. Model integration checks use tiny synthetic videos and
+CPU models; download/ASR checks use mocks or fixtures rather than remote datasets
+or downloaded speech-model weights. Optional dependency/device checks may skip
+when their prerequisites are unavailable.
+The FFmpeg download integration test also needs permission to open a local
+HTTP server on `127.0.0.1`.
+
+For a focused check, select one module by filename. For example, the runner
+suite includes a small training-and-checkpoint-evaluation integration:
 
 ```bash
 python3 -m unittest discover -s tests -p test_run_all_variants.py -v

@@ -316,8 +316,10 @@ variant,checkpoint,sample_index,video,text,unit,count,avg_nll,avg_margin
 
 Here `z = softmax(logits)` over the entire vocabulary at temperature 1, and `j`
 is the true class. Evaluation uses the true preceding text, dropout disabled,
-and no regularization terms. Metrics describe the training samples, not a held-out
-test set or free-running transcription. For variants 1–4, each transcript token
+and no regularization terms. Automatic training CSVs describe the training split;
+validation CSVs and the standalone evaluator describe their supplied splits.
+These are teacher-forced scores, not free-running transcription metrics.
+For variants 1–4, each transcript token
 is evaluated at its supervised window end; BOS, padding, and EOS are excluded
 from the means by default. Add `--metrics-include-eos` to include the true terminal
 EOS in token metrics. Variant 5 averages only labeled frames, including every frame
@@ -339,8 +341,9 @@ python3 tests/evaluate_checkpoints.py \
   --output results/all_variants.csv --batch-size 2
 ```
 
-The evaluator uses each checkpoint's tokenizer, architecture, preprocessing and
-saved section size; `--max-frames` overrides that size. Its optional `--include-eos`
+The evaluator uses each checkpoint's tokenizer, architecture, preprocessing,
+saved AMP setting, and section size; `--max-frames` overrides that size, and
+`--amp`/`--no-amp` overrides CUDA mixed precision. Its optional `--include-eos`
 matches training's `--metrics-include-eos`. It also accepts `--device`, `--workers`,
 and `--no-face-detector`. Older checkpoints can be evaluated with this script too.
 
@@ -360,13 +363,21 @@ value for a **new** model. Use a matching variant checkpoint for variants 3/4/5;
 resuming with a mismatched fusion raises an error. Variants 1/2 share an
 architecture and can resume each other's checkpoints. As in the original trainer,
 training hyperparameters come from the current invocation: repeat any customized
-margin, loss coefficient, learning rate or batch size (or set them in `DEFAULTS`).
+margin, loss coefficient, learning rate, batch size, `--amp`, `--max-frames`, or
+`--no-face-detector` setting (or set them in `DEFAULTS`). Epoch counts request
+additional epochs; optimizers, gradient-scaler state, and RNG state are not
+restored. Further token training resets the confidence-trained status and its
+epoch count, so refit confidence for the updated model.
 `training_args` in the checkpoint provides a record of those settings.
 For frame checkpoints, cached prediction returns the current frame's distribution;
 `infer.py` does not perform an end-of-video autoregressive `--flush-tokens` pass.
 
-Run the offline regression checks with:
+Install `requirements-downvid.txt` for grouping dependencies, then run the
+regression checks from the repository root:
 
 ```bash
-python3 -m unittest tests.test_arch_variants tests.test_frame_metrics tests.test_run_all_variants
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
+
+For the runner's command-routing and CPU integration checks alone, use
+`python3 -m unittest discover -s tests -p test_run_all_variants.py -v`.
