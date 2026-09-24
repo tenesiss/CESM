@@ -5,6 +5,7 @@ All training options come directly from train.build_argparser(). See --help
 and README.md for download/preprocessing options. N counts usable clips, not
 unique source uploads. HDTF and Shofo use hosted videos without YouTube access.
 --N-pretrain independently counts unannotated videos for visual pretraining.
+--N-valid independently counts additional, source-disjoint validation clips.
 """
 
 from __future__ import annotations
@@ -63,6 +64,9 @@ def build_argparser():
             action.help = "Generated JSONL path (default: WORK_DIR/data.jsonl)"
         elif action.dest == "pretrain_manifest":
             action.help = "Pretraining JSONL to reuse, or output path with --N-pretrain (default: WORK_DIR/pretrain.jsonl)"
+        elif action.dest == "num_valid":
+            action.help = "Download this many additional validation clips to WORK_DIR/validation.jsonl; " \
+                          "excludes training/pretraining videos and source uploads, and enables early stopping"
     group = parser.add_argument_group("Dataset download and preprocessing")
     group.add_argument("--dataset", choices=["talkvid", "hdtf", "shofo"], default="talkvid",
                        help="Video source (default: talkvid); hdtf and shofo download hosted MP4s")
@@ -89,7 +93,7 @@ def build_argparser():
                        help="Exclude local videos and known source uploads from this JSONL (for validation downloads)")
     group.add_argument("--max-attempts", type=positive_int,
                        help="Maximum eligible, distinct clips to try; remaining clips from an "
-                            "unavailable upload are skipped without attempts (default: 10 * max(N, N-pretrain))")
+                            "unavailable upload are skipped without attempts (default: 10 * max(N, N-valid, N-pretrain))")
     group.add_argument("--download-timeout", type=positive_int, default=600,
                        help="Per-clip download timeout in seconds")
     group.add_argument("--download-retries", type=int, default=3)
@@ -771,7 +775,7 @@ def training_record(manifest, tokenizer, window_unit, video):
             "window_unit": window_unit}
 
 
-def prepare(args, *, video_only=False):
+def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
     import train
 
     resume_chars = None
@@ -794,10 +798,11 @@ def prepare(args, *, video_only=False):
               "manifest": str(args.manifest), "results": [], "failures": [],
               "unavailable_sources": {}, "skipped_unavailable_clips": 0,
               "skipped_excluded_clips": 0}
-    report_path = args.work_dir / ("pretrain_report.json" if video_only else "run_report.json")
+    report_path = args.work_dir / ("pretrain_report.json" if video_only else
+                                   "validation_report.json" if validation else "run_report.json")
     records, seen = [], set()
     excluded = set()
-    for manifest_path in (args.exclude_manifest, args.validation_manifest):
+    for manifest_path in (args.exclude_manifest, args.validation_manifest, *exclude_manifests):
         if manifest_path:
             excluded.update(train.video_identity_keys(train.load_manifest(manifest_path, video_only=True)))
     attempts = 0
@@ -915,7 +920,7 @@ def prepare(args, *, video_only=False):
                 f"Training was not started. See {report_path}; partial data: {partial}. "
                 "Increase --max-attempts or change the dataset/source/filter. Completed clips are cached."
             )
-        if resume_chars is not None:
+        if resume_chars is not None and not validation:
             vocabulary = train.CharTokenizer.build(record["text"] for record in records).itos
             if vocabulary != resume_chars:
                 raise ValueError("--resume requires exactly the checkpoint's character vocabulary; "
@@ -940,6 +945,10 @@ def training_command(args):
     for action in train.build_argparser()._actions:
         if action.dest == "help":
             continue
+        # The downloader has already prepared a separate validation manifest;
+        # do not ask train.py to split the training manifest a second time.
+        if action.dest == "num_valid" and args.validation_manifest:
+            continue
         value = getattr(args, action.dest)
         if isinstance(action, argparse.BooleanOptionalAction):
             if value is not None:
@@ -956,8 +965,15 @@ def training_command(args):
 def validate_args(parser, args):
     import train
 
+    try:
+        train.validate_validation_args(args)
+        train.validate_early_stopping_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.num_videos is None and not args.pretrain_only and not (args.num_pretrain is not None and args.prepare_only):
         parser.error("--num-videos/-N is required except with --login, --logout, --pretrain-only, or --N-pretrain --prepare-only")
+    if args.num_valid is not None and args.num_videos is None:
+        parser.error("--N-valid requires --num-videos/-N")
     args.work_dir = (args.work_dir or ROOT / "data" / args.dataset).expanduser().resolve()
     if args.dataset in ("hdtf", "shofo"):
         if args.metadata != DEFAULT_METADATA:
@@ -976,6 +992,17 @@ def validate_args(parser, args):
         args.manifest = Path(args.manifest).expanduser().resolve()
     elif not args.pretrain_only or args.num_videos is not None:
         args.manifest = args.work_dir / "data.jsonl"
+    if args.num_valid is not None:
+        validation_manifest = args.work_dir / "validation.jsonl"
+        metrics_path = (Path(args.output).with_suffix(".metrics.csv") if args.metrics_csv == "auto"
+                        else args.metrics_csv)
+        protected = (args.manifest, args.pretrain_manifest, args.exclude_manifest, args.output, args.resume,
+                     metrics_path, Path(args.output).with_suffix(".learning.csv"),
+                     Path(args.output).with_suffix(".learning.png"))
+        if any(path and Path(path).expanduser().resolve() == validation_manifest for path in protected):
+            parser.error("Generated validation manifest must differ from training/pretraining/exclusion manifests "
+                         "and output/checkpoint paths")
+        args.validation_manifest = str(validation_manifest)
     if args.pretrain_only:
         args.pretrain_visual_encoder = True
     if args.num_pretrain is not None or args.pretrain_manifest:
@@ -1005,10 +1032,10 @@ def validate_args(parser, args):
         parser.error(f"Frame grouping code not found: {args.group_frames_code}")
     if args.start_index < 0 or args.download_retries < 0:
         parser.error("--start-index and --download-retries must be >= 0")
-    requested = max(args.num_videos or 0, args.num_pretrain or 0)
+    requested = max(args.num_videos or 0, args.num_valid or 0, args.num_pretrain or 0)
     args.max_attempts = args.max_attempts or 10 * requested
     if args.max_attempts < requested:
-        parser.error("--max-attempts must be >= --num-videos and --N-pretrain")
+        parser.error("--max-attempts must be >= --num-videos, --N-valid and --N-pretrain")
     if args.dataset == "talkvid":
         use_saved_login(args)
         if args.cookies and not args.cookies.expanduser().is_file():
@@ -1024,6 +1051,8 @@ def validate_args(parser, args):
     if args.epochs < 0 or args.confidence_epochs < 0:
         parser.error("--epochs and --confidence-epochs must be >= 0")
     pretrain_only = args.pretrain_only or (args.pretrain_visual_encoder and args.confidence_epochs == 0)
+    if args.num_valid is not None and args.pretrain_visual_encoder and args.epochs == 0 and args.confidence_epochs == 0:
+        parser.error("--N-valid requires supervised training epochs")
     if args.epochs == 0 and not args.resume and not args.prepare_only and not pretrain_only:
         parser.error("--epochs 0 requires --resume")
     if args.fine_tune_pretrained_lm and not (args.resume or args.pretrained_lm):
@@ -1064,7 +1093,21 @@ def main(argv=None):
     validate_args(parser, args)
     if args.prepare_only:
         if args.num_videos is not None:
-            prepare(args)
+            training_args = argparse.Namespace(**vars(args))
+            if args.num_valid is not None:
+                # This run generates validation after training, so an old
+                # validation manifest must not change the training selection.
+                training_args.validation_manifest = None
+            prepare(training_args)
+        if args.num_valid is not None:
+            validation_args = argparse.Namespace(**vars(args))
+            validation_args.num_videos = args.num_valid
+            validation_args.manifest = Path(args.validation_manifest)
+            validation_args.validation_manifest = None
+            exclusions = [args.manifest]
+            if args.pretrain_manifest and args.num_pretrain is None:
+                exclusions.append(args.pretrain_manifest)
+            prepare(validation_args, validation=True, exclude_manifests=exclusions)
         if args.num_pretrain is not None:
             pretrain_args = argparse.Namespace(**vars(args))
             pretrain_args.num_videos = args.num_pretrain

@@ -4,6 +4,7 @@ import contextlib
 import csv
 import io
 import json
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,52 @@ import numpy as np
 import torch
 
 import train
+
+
+class ValidationSplitTests(unittest.TestCase):
+    def test_count_is_positive_and_exclusive_with_a_manifest(self):
+        for flags in (["--N-valid", "0"], ["--N-valid", "-1"], ["--N-valid", "1.5"],
+                      ["--N-valid", "1", "--validation-manifest", "valid.jsonl"]):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                train.build_argparser().parse_args(flags)
+
+    def test_seeded_split_is_exact_disjoint_and_keeps_original_order(self):
+        rows = [{"video": f"/tmp/clip-{i}.mp4"} for i in range(12)]
+        state = random.getstate()
+        training, validation = train.split_validation_rows(rows, 4, 42)
+        self.assertEqual((len(training), len(validation)), (8, 4))
+        self.assertEqual((training, validation), train.split_validation_rows(rows, 4, 42))
+        self.assertNotEqual(validation, train.split_validation_rows(rows, 4, 43)[1])
+        self.assertEqual(random.getstate(), state)
+        self.assertEqual(validation, [row for row in rows if row not in training])
+        train.validate_validation_split(training, validation)
+
+    def test_connected_paths_and_sources_are_never_split(self):
+        # Groups have sizes 3 and 2; a greedy selection of the pair would fail
+        # even though holding out exactly three rows is possible.
+        rows = [{"video": "/tmp/a.mp4", "source_key": "one"},
+                {"video": "/tmp/b.mp4", "source_key": "one"},
+                {"video": "/tmp/b.mp4", "source_key": "two"},
+                {"video": "/tmp/c.mp4", "source_key": "three"},
+                {"video": "/tmp/d.mp4", "source_key": "three"}]
+        for seed in range(4):
+            training, validation = train.split_validation_rows(rows, 3, seed)
+            self.assertEqual(validation, rows[:3])
+            train.validate_validation_split(training, validation)
+        with self.assertRaisesRegex(ValueError, "without splitting"):
+            train.split_validation_rows(rows, 1, 42)
+
+    def test_pretraining_sources_are_excluded_and_impossible_counts_fail(self):
+        rows = [{"video": f"/tmp/clip-{i}.mp4", "source_key": str(i)} for i in range(3)]
+        pretraining = [{"video": "/tmp/pretrain.mp4", "source_key": "0"}, rows[1]]
+        training, validation = train.split_validation_rows(rows, 1, 42, excluded_rows=pretraining)
+        self.assertEqual(validation, [rows[2]])
+        train.validate_validation_split(training + pretraining, validation)
+        with self.assertRaisesRegex(ValueError, "overlapping pretraining"):
+            train.split_validation_rows(rows, 2, 42, excluded_rows=pretraining)
+        for count in (0, 3, 4):
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, "smaller than"):
+                train.split_validation_rows(rows, count, 42)
 
 
 class ValidationMonitorTests(unittest.TestCase):
@@ -137,6 +184,45 @@ class ValidationTrainingTests(unittest.TestCase):
         self.assertEqual(actual.keys(), expected.keys())
         for name in actual:
             torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0, msg=name)
+
+    def test_n_valid_trains_only_remaining_rows_and_records_both_validation_stages(self):
+        manifest = self.root / "combined.jsonl"
+        manifest.write_text((self.root / "train.jsonl").read_text() + (self.root / "valid.jsonl").read_text())
+        args = self.args("--manifest", str(manifest), "--epochs", "1", "--confidence-epochs", "1")
+        args.validation_manifest = None
+        args.num_valid = 1
+        training, validation = train.split_validation_rows(train.load_manifest(manifest), 1, args.seed)
+        with contextlib.redirect_stdout(io.StringIO()):
+            train.train(args)
+        saved = torch.load(args.output, map_location="cpu", weights_only=False)
+        self.assertEqual(saved["training_args"]["num_valid"], 1)
+        self.assertEqual(set(saved["validation_selection"]), {"token", "confidence"})
+        with Path(args.output).with_suffix(".metrics.csv").open() as stream:
+            metrics = list(csv.DictReader(stream))
+        self.assertEqual([row["video"] for row in metrics], [row["video"] for row in training])
+        with Path(args.output).with_suffix(".learning.csv").open() as stream:
+            curves = list(csv.DictReader(stream))
+        self.assertEqual([row["stage"] for row in curves], ["token", "confidence"])
+        self.assertTrue(all(row["validation_loss"] and row["validation_accuracy"] for row in curves))
+        self.assertTrue(Path(args.output).with_suffix(".learning.png").is_file())
+        self.assertEqual(len(train.load_manifest(manifest)), 2)  # Input remains intact.
+        args.resume = args.output
+        args.epochs = 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            train.train(args)
+        with Path(args.output).with_suffix(".metrics.csv").open() as stream:
+            self.assertEqual([row["video"] for row in csv.DictReader(stream)], [training[0]["video"]])
+
+    def test_invalid_holdout_fails_before_model_creation(self):
+        for count, pretrain_only, message in ((1, False, "smaller than"), (1, True, "pretrain-only")):
+            args = self.args()
+            args.validation_manifest = None
+            args.num_valid = count
+            args.pretrain_only = pretrain_only
+            with self.subTest(pretrain_only=pretrain_only), patch.object(train, "UnnobaModel") as model, \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, message):
+                train.train(args)
+            model.assert_not_called()
 
     def test_both_stages_stop_restore_weights_and_metrics_use_best_checkpoint(self):
         for fusion in ("residual", "frame"):

@@ -56,7 +56,8 @@ class LearningCurveLogger:
     def __init__(self, args):
         self.selected = [curve for curve in CURVES
                          if args.plot_learning_curves and getattr(args, "plot_" + curve)
-                         and (not curve.startswith("validation_") or args.validation_manifest)]
+                         and (not curve.startswith("validation_") or args.validation_manifest
+                              or getattr(args, "num_valid", None))]
         self.csv_path = Path(args.output).with_suffix(".learning.csv")
         self.plot_path = Path(args.output).with_suffix(".learning.png")
         self.title = args.variant_name or Path(args.output).stem

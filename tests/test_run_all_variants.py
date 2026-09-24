@@ -211,6 +211,7 @@ class AllVariantRunnerTests(unittest.TestCase):
             ["-N", "1", "--early-stopping-patience", "-1"],
             ["-N", "1", "--early-stopping-min-delta", "nan"],
             ["-N", "1", "--variant-args", "1:--validation-manifest other.jsonl"],
+            ["-N", "1", "--variant-args", "1:--N-valid 1"],
             ["-N", "1", "--N-pretrain", "0"],
             ["-N", "1", "--N-pretrain", "-1"],
             ["-N", "1", "--N-pretrain", "2", "--pretrain-manifest", "other.jsonl"],

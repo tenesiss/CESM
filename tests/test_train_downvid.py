@@ -1,6 +1,7 @@
 """Offline coverage of TalkVid selection, alignment, caching, and trainer handoff."""
 
 import contextlib
+import csv
 import importlib.util
 import io
 import json
@@ -318,6 +319,72 @@ class PipelineTests(PipelineFixture):
                 pipeline.main(["-N", "2"])
         self.assertEqual(run.call_count, 1)
         self.assertIn("--prepare-only", run.call_args.args[0])
+
+
+class PipelineValidationTests(PipelineFixture):
+    def test_validation_downloads_are_additional_and_handoff_uses_manifest(self):
+        for dataset in ("talkvid", "hdtf", "shofo"):
+            with self.subTest(dataset=dataset):
+                preparations, commands = [], []
+
+                def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
+                    preparations.append((args.num_videos, args.manifest, args.validation_manifest,
+                                         video_only, validation, list(exclude_manifests)))
+
+                def run(command, **kwargs):
+                    commands.append(command)
+                    if "--prepare-only" in command:
+                        pipeline.main(command[2:])
+
+                with patch.object(pipeline.importlib.util, "find_spec", return_value=object()), \
+                        patch.object(pipeline, "validate_download_runtimes"), \
+                        patch.object(pipeline.shutil, "which", return_value="tool"), \
+                        patch.object(pipeline, "prepare", side_effect=prepare), \
+                        patch.object(pipeline.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+                    pipeline.main(["--dataset", dataset, "-N", "2", "--N-valid", "3", "--N-pretrain", "4",
+                                   "--work-dir", str(self.root)])
+                validation_path = self.root / "validation.jsonl"
+                self.assertEqual(preparations, [
+                    (2, self.root / "data.jsonl", None, False, False, []),
+                    (3, validation_path, None, False, True, [self.root / "data.jsonl"]),
+                    (4, self.root / "pretrain.jsonl", str(validation_path), True, False, []),
+                ])
+                forwarded = train.build_argparser().parse_args(commands[-1][2:])
+                self.assertEqual(forwarded.validation_manifest, str(validation_path))
+                self.assertIsNone(forwarded.num_valid)
+
+    def test_prepare_only_excludes_reused_pretraining_and_preserves_external_exclusions(self):
+        pretraining = self.root / "pretrain.jsonl"
+        pretraining.write_text(json.dumps({"video": "pretrained.mp4"}) + "\n")
+        excluded = self.root / "exclude.jsonl"
+        with patch.object(pipeline.importlib.util, "find_spec", return_value=object()), \
+                patch.object(pipeline, "validate_download_runtimes"), \
+                patch.object(pipeline.shutil, "which", return_value="tool"), \
+                patch.object(pipeline, "prepare") as prepare, patch.object(pipeline.subprocess, "run") as run:
+            pipeline.main(["-N", "2", "--N-valid", "1", "--prepare-only", "--work-dir", str(self.root),
+                           "--pretrain-manifest", str(pretraining), "--exclude-manifest", str(excluded)])
+        self.assertEqual(prepare.call_count, 2)
+        self.assertEqual(prepare.call_args.kwargs["exclude_manifests"],
+                         [self.root / "data.jsonl", str(pretraining)])
+        self.assertEqual(prepare.call_args.args[0].exclude_manifest, excluded)
+        run.assert_not_called()
+
+    def test_invalid_validation_options_fail_before_download(self):
+        validation_path = str(self.root / "validation.jsonl")
+        for flags in (["--N-valid", "0"], ["--N-valid", "-1"], ["--N-valid", "1.5"],
+                      ["--N-valid", "1", "--validation-manifest", "valid.jsonl"],
+                      ["--N-valid", "1", "--pretrain-only"],
+                      ["--N-valid", "3", "--max-attempts", "2"],
+                      ["--N-valid", "1", "--manifest", validation_path],
+                      ["--N-valid", "1", "--pretrain-manifest", validation_path],
+                      ["--N-valid", "1", "--output", validation_path],
+                      ["--N-valid", "1", "--metrics-csv", validation_path]):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), \
+                    patch.object(pipeline, "prepare") as prepare, \
+                    patch.object(pipeline, "validate_download_runtimes") as runtimes, self.assertRaises(SystemExit):
+                pipeline.main(["-N", "1", "--work-dir", str(self.root), *flags])
+            prepare.assert_not_called()
+            runtimes.assert_not_called()
 
 
 @unittest.skipUnless(importlib.util.find_spec("yt_dlp"), "yt-dlp is unavailable")
@@ -891,6 +958,62 @@ class GrouperIntegrationTests(PipelineFixture):
         self.assertEqual(checkpoint["epoch"], 1)
         self.assertEqual(checkpoint["confidence_epoch"], 1)
         self.assertTrue(checkpoint["confidence"]["trained"])
+
+    def test_n_valid_pipeline_trains_and_plots_with_source_disjoint_downloads(self):
+        flags = ["-N", "1", "--N-valid", "1", "--work-dir", str(self.root),
+                 "--epochs", "1", "--confidence-epochs", "1", "--batch-size", "1",
+                 "--device", "cpu", "--mouth-size", "16", "--d-video", "8", "--d-text", "8",
+                 "--d-fusion", "8", "--heads", "2", "--video-layers", "1", "--text-layers", "1",
+                 "--conv3d-channels", "4", "--no-face-detector", "--max-frames", "8",
+                 "--metrics-csv", "auto", "--output", str(self.root / "model.pt")]
+        metadata = [self.row(), self.row(**{"start-time": 2, "end-time": 3}), self.row(1)]
+
+        def download(clip, args):
+            path = self.root / f"{clip.key}.avi"
+            if not path.exists():
+                shutil.copyfile(self.video, path)
+            return path
+
+        def run(command, **kwargs):
+            if "--prepare-only" in command:
+                pipeline.main(command[2:])
+            else:
+                train.train(train.build_argparser().parse_args(command[2:]))
+
+        threads = torch.get_num_threads()
+        try:
+            torch.set_num_threads(1)
+            with patch.object(pipeline.importlib.util, "find_spec", return_value=object()), \
+                    patch.object(pipeline, "validate_download_runtimes"), \
+                    patch.object(pipeline.shutil, "which", return_value="tool"), \
+                    patch.object(pipeline, "iter_metadata", side_effect=lambda _: (row for row in metadata)), \
+                    patch.object(pipeline, "load_grouper", return_value=self.grouper), \
+                    patch.object(pipeline, "download_clip", side_effect=download), \
+                    patch.object(self.grouper, "WhisperModel"), \
+                    patch.object(self.grouper, "transcribe_words", side_effect=[
+                        ("hi", self.words), ("ha", [self.grouper.WordSpan("ha", 0, 2, 0.1, 0.8)])]), \
+                    patch.object(pipeline.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+                pipeline.main(flags)
+                # Reuse cached alignments on resume; validation need not have
+                # exactly the training vocabulary, and old validation is ignored
+                # while preparing the training set again.
+                pipeline.main([*flags, "--resume", str(self.root / "model.pt"), "--prepare-only"])
+        finally:
+            torch.set_num_threads(threads)
+        training = train.load_manifest(self.root / "data.jsonl")
+        validation = train.load_manifest(self.root / "validation.jsonl")
+        self.assertEqual((len(training), len(validation)), (1, 1))
+        train.validate_validation_split(training, validation)
+        report = pipeline.read_cache(self.root / "validation_report.json")
+        self.assertEqual((report["attempts"], report["skipped_excluded_clips"]), (1, 2))
+        self.assertEqual(pipeline.read_cache(self.root / "run_report.json")["usable"], 1)
+        with (self.root / "model.learning.csv").open() as stream:
+            curves = list(csv.DictReader(stream))
+        self.assertEqual([row["stage"] for row in curves], ["token", "confidence"])
+        self.assertTrue(all(row["validation_loss"] and row["validation_accuracy"] for row in curves))
+        self.assertTrue((self.root / "model.learning.png").is_file())
+        with (self.root / "model.metrics.csv").open() as stream:
+            self.assertEqual([row["video"] for row in csv.DictReader(stream)], [training[0]["video"]])
 
 
 if __name__ == "__main__":

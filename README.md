@@ -176,6 +176,24 @@ python3 train.py --manifest data/train.jsonl \
   --early-stopping-patience 5 --output checkpoints/cesm.pt
 ```
 
+Alternatively, hold out exactly N clips from a single manifest:
+
+```bash
+python3 train.py --manifest data/all.jsonl --N-valid 20 \
+  --output checkpoints/cesm.pt --metrics-csv auto
+```
+
+`--N-valid` and `--validation-manifest` are mutually exclusive. In `train.py`
+and the individual variant scripts, `--N-valid` removes N original manifest
+rows from training before frame sectioning and vocabulary construction. Selection
+uses `--seed` (default `1337`) and keeps all rows sharing a video path or source
+upload together. Sources present in a pretraining manifest remain in training.
+If no exact split is possible, or no training rows would remain, the command
+fails before creating the model. The input manifest is unchanged; use the same
+manifest, count, seed, and pretraining data when resuming to reproduce the split.
+Validation learning curves and early stopping are enabled automatically. The
+final per-sample `--metrics-csv` still evaluates only the training rows.
+
 Training and validation must use separate videos. The loader rejects shared
 resolved video paths and matching nonempty `source_key` values. Set the same
 `source_key` on all clips from one source upload when preparing your own data;
@@ -558,7 +576,7 @@ checkpoint after every token/confidence epoch. Visual pretraining reports its
 component losses in the console and is not included in these curves.
 All four curves are enabled by default: training loss, validation loss, training
 accuracy, and validation accuracy. Validation
-curves require `--validation-manifest` (or `--N-valid` in the runner); they are
+curves require `--validation-manifest` or `--N-valid`; they are
 omitted when no validation set is supplied.
 
 Disable individual curves with `--no-plot-training-loss`,
@@ -842,12 +860,13 @@ to select a runtime outside PATH. Authentication can be supplied using
 | `--N-pretrain N` | Download N unannotated videos independently of `-N` and enable visual pretraining. |
 | `--pretrain-only` | Save after visual pretraining; use `--N-pretrain` or `--pretrain-manifest`. Resume without pretraining flags for full training. |
 | `--pretrain-manifest PATH` | Reuse pretraining videos, or choose their output manifest with `--N-pretrain`. |
+| `--N-valid N` | Download N additional validation clips to `WORK_DIR/validation.jsonl`, separate from the `-N` training clips. |
 | `--prepare-only` | Create the dataset without launching training. |
 | `--metadata PATH_OR_URL` | TalkVid: override metadata with a JSON array or JSONL file/URL. |
 | `--dataset-language English` | Filter metadata by language name; repeat to include several languages. |
 | `--start-index N` | Skip N TalkVid metadata rows or N HDTF/Shofo videos in filename order. |
 | `--exclude-manifest PATH` | Exclude matching video paths and known source uploads during preparation. |
-| `--max-attempts N` | Limit eligible, distinct clips attempted per preparation pass; default is `10 * max(N, N-pretrain)`. |
+| `--max-attempts N` | Limit eligible, distinct clips attempted per preparation pass; default is `10 * max(N, N-valid, N-pretrain)`. |
 | `--whisper-model small` | faster-whisper model name, size, or local directory. |
 | `--language en` | Force the ASR language; omitted by default for automatic detection. |
 | `--whisper-device cpu` | ASR device, independent of the trainer's `--device`. |
@@ -863,9 +882,20 @@ to select a runtime outside PATH. Authentication can be supplied using
 | `--image-ext jpg` / `--jpeg-quality 95` | Settings for the grouper's saved frame images. |
 | `--reprocess` | Recompute frame alignments while reusing completed downloads. |
 
-`--N-valid` belongs to `run_all_variants.py`. For the standalone downloader,
-prepare validation separately with `--exclude-manifest data/train.jsonl`, then
-pass the result to training with `--validation-manifest`.
+Both `train_downvid.py` and `run_all_variants.py` accept `--N-valid` to download
+additional validation clips, keeping `-N` as the training count:
+
+```bash
+python3 train_downvid.py --dataset hdtf -N 100 --N-valid 20 \
+  --work-dir data/hdtf --output checkpoints/hdtf.pt --metrics-csv auto
+```
+
+The standalone downloader saves validation to `WORK_DIR/validation.jsonl` and
+its preparation report to `WORK_DIR/validation_report.json`. Validation excludes
+training videos/source uploads and any reused pretraining data. Downloads requested
+with `--N-pretrain` run afterward and exclude validation. `--prepare-only` prepares
+all requested sets without training; `--pretrain-only` cannot use `--N-valid`.
+Use `--validation-manifest` instead to reuse a separate validation set.
 
 ### Downloads and caching
 

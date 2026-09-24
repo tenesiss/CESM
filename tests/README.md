@@ -93,6 +93,12 @@ the original fifty token epochs. Use `--help` on any script for the full CLI.
 Scripts can also be invoked by absolute path from another directory; relative
 manifest and output paths resolve from the current working directory.
 
+The individual scripts also accept `--N-valid N` to hold out exactly N rows
+from `--manifest`, using `--seed` and keeping videos/source uploads together.
+This enables validation curves and early stopping. It is mutually exclusive
+with `--validation-manifest`. The runner below instead downloads N additional
+validation clips, preserving the number of training clips.
+
 ## All-in-one download, train and evaluate
 
 From the repository root, run `run_all_variants.py` to download and align TalkVid, HDTF, or Shofo

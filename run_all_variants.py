@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parent
 VARIANTS = (train_1_as_is, train_2_tcross_loss, train_3_no_ht0,
             train_4_weighted_ht0, train_5_frame_tokens)
 MANAGED = {"help", "manifest", "output", "resume", "confidence_only",
-           "text_fusion", "variant_name", "metrics_csv", "validation_manifest", "pretrain_manifest"}
+           "text_fusion", "variant_name", "metrics_csv", "validation_manifest", "num_valid", "pretrain_manifest"}
 DOWNLOAD_ONLY = {"num_videos", "num_pretrain", "prepare_only", "login", "logout", "exclude_manifest"}
 SPECIFIC = {"lambda_tcross": {2}, "tcross_margin": {2}, "w_t": {4},
             "vcross_weight": {5}, "window_phasing": {5},

@@ -600,6 +600,54 @@ def validate_validation_split(training_rows, validation_rows) -> None:
         raise ValueError("Training and validation manifests overlap: use separate videos/source uploads")
 
 
+def split_validation_rows(rows, num_valid, seed, *, excluded_rows=()):
+    """Hold out exactly N rows, keeping connected videos/source uploads together."""
+    if not 0 < num_valid < len(rows):
+        raise ValueError("--N-valid must be > 0 and smaller than the number of manifest rows")
+    parents = list(range(len(rows)))
+
+    def root(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    owners = {}
+    for index, row in enumerate(rows):
+        for key in video_identity_keys([row]):
+            if key in owners:
+                parents[root(index)] = root(owners[key])
+            else:
+                owners[key] = index
+    groups = {}
+    for index in range(len(rows)):
+        groups.setdefault(root(index), []).append(index)
+    excluded = video_identity_keys(excluded_rows)
+    candidates = [indices for indices in groups.values()
+                  if not (video_identity_keys([rows[i] for i in indices]) & excluded)]
+    random.Random(seed).shuffle(candidates)
+    # Subset sums avoid rejecting a feasible count just because a larger group
+    # was shuffled before a smaller one. Keep back-pointers rather than copies.
+    reachable = {0: None}
+    for group_index, indices in enumerate(candidates):
+        for count in list(reachable):
+            total = count + len(indices)
+            if total <= num_valid and total not in reachable:
+                reachable[total] = (count, group_index)
+        if num_valid in reachable:
+            break
+    if num_valid not in reachable:
+        raise ValueError("--N-valid cannot select exactly this many clips without splitting a video/source upload "
+                         "or overlapping pretraining; choose another count or --validation-manifest")
+    held_out = set()
+    count = num_valid
+    while count:
+        count, group_index = reachable[count]
+        held_out.update(candidates[group_index])
+    return ([row for i, row in enumerate(rows) if i not in held_out],
+            [row for i, row in enumerate(rows) if i in held_out])
+
+
 def repair_quantized_empty_windows(
     windows: Sequence[Tuple[int, int]],
 ) -> Tuple[List[Tuple[int, int]], int]:
@@ -2967,6 +3015,23 @@ def validate_early_stopping_args(args) -> None:
         raise ValueError("--early-stopping-min-delta must be finite and >= 0")
 
 
+def positive_int(value):
+    result = int(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return result
+
+
+def validate_validation_args(args) -> None:
+    if args.num_valid is not None:
+        if args.num_valid <= 0:
+            raise ValueError("--N-valid must be > 0")
+        if args.validation_manifest:
+            raise ValueError("--N-valid and --validation-manifest are mutually exclusive")
+        if args.pretrain_only:
+            raise ValueError("--N-valid cannot be combined with --pretrain-only")
+
+
 @dataclass
 class ValidationMonitor:
     """Stop on validation plateaus; select the exact minimum joint loss separately."""
@@ -3218,6 +3283,7 @@ def validate_pretraining_args(args) -> None:
 
 
 def train(args) -> None:
+    validate_validation_args(args)
     validate_early_stopping_args(args)
     validate_pretraining_args(args)
     accuracy_decode_args(args)
@@ -3266,6 +3332,8 @@ def train(args) -> None:
             raise ValueError("--confidence-only requires --confidence-epochs > 0")
         args.epochs = 0
     pretrain_only = args.pretrain_visual_encoder and args.epochs == 0 and args.confidence_epochs == 0
+    if pretrain_only and args.num_valid is not None:
+        raise ValueError("--N-valid requires supervised training epochs")
     if args.epochs == 0 and not args.resume and not pretrain_only:
         raise ValueError("--epochs 0 requires --resume; otherwise the token model would be random")
     if args.confidence_beta <= 0:
@@ -3295,10 +3363,16 @@ def train(args) -> None:
     rows = load_manifest(args.manifest) if args.manifest else []
     pretrain_rows = load_manifest(args.pretrain_manifest, video_only=True) if args.pretrain_visual_encoder else None
     validation_rows = load_manifest(args.validation_manifest) if args.validation_manifest else None
+    if args.num_valid is not None:
+        rows, validation_rows = split_validation_rows(
+            rows, args.num_valid, args.seed, excluded_rows=pretrain_rows or (),
+        )
+        print(f"held out {len(validation_rows)} validation clips; training clips={len(rows)}; seed={args.seed}")
     if validation_rows is not None:
         validate_validation_split(rows, validation_rows)
         if pretrain_rows is not None:
             validate_validation_split(pretrain_rows, validation_rows)
+    if args.validation_manifest:
         if Path(args.output).resolve() == Path(args.validation_manifest).resolve():
             raise ValueError("--output must differ from --validation-manifest")
         if metrics_path and Path(metrics_path).resolve() == Path(args.validation_manifest).resolve():
@@ -3776,8 +3850,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Pretraining off-diagonal covariance weight, summed over both views (default: 0.04)")
     p.add_argument("--pretrain-variance-floor", type=float, default=1.0,
                    help="Target minimum per-feature standard deviation across valid frames (default: 1; must be > 0)")
-    p.add_argument("--validation-manifest", default=None,
-                   help="Separate validation JSONL; enables best-checkpoint selection and early stopping")
+    validation = p.add_mutually_exclusive_group()
+    validation.add_argument("--validation-manifest", default=None,
+                            help="Separate validation JSONL; enables best-checkpoint selection and early stopping")
+    validation.add_argument("--N-valid", dest="num_valid", type=positive_int,
+                            help="Hold out exactly N manifest clips for validation, grouped by video/source upload "
+                                 "and shuffled with --seed; enables early stopping")
     p.add_argument("--early-stopping-patience", type=int, default=5,
                    help="Epochs without validation-loss improvement before stopping each stage (default: 5; 0 disables)")
     p.add_argument("--early-stopping-min-delta", type=float, default=0.0,
