@@ -870,6 +870,13 @@ tokenizer copy. More concurrent transcriptions use more RAM/VRAM; reduce
 `--alignment-workers` or use `--sequential-alignment` if needed. Worker counts
 do not change cache keys: completed alignments are reusable between modes.
 
+Fully cached clips are validated on the main thread and bypass both worker pools.
+Reusing an alignment leaves its cache files unchanged and does not copy tokenizers
+or load Whisper. New alignments store the configuration, including pretrained
+tokenizer state, once under `WORK_DIR/alignment_configs/`; each clip's completion
+marker contains only its video signature and configuration key. Existing cache
+markers containing the full configuration remain usable without migration.
+
 Manifest and report writes stay sequential. Results retain source order even
 when downloads or alignments finish out of order. Both stages share a bounded
 candidate budget: outstanding work is limited by their worker counts, the number
@@ -882,6 +889,8 @@ downloads and alignments stay cached for recovery. Reports include effective
 download/alignment worker counts and count scheduled candidates as attempts, including
 in-flight candidates when an error stops the run; the final manifest is replaced
 only after all requested clips are usable.
+Reports are checkpointed at most once per second and always saved on completion
+or failure; the partial JSONL manifest is still flushed after every usable clip.
 
 For Shofo on a fast connection, optional `HF_XET_HIGH_PERFORMANCE=1` enables
 more aggressive Xet transfer settings. Xet already performs concurrent transfers

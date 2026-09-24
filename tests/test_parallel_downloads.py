@@ -55,6 +55,14 @@ class ParallelDownloadTests(PipelineFixture):
     def records(self, args):
         return train.load_manifest(args.manifest, video_only=True)
 
+    def seed_download(self, clip, args):
+        folder = pipeline.download_folder(clip, args)
+        folder.mkdir(parents=True, exist_ok=True)
+        video = folder / "video.mp4"
+        video.write_bytes(b"video")
+        pipeline.write_json(folder / "download.json", {"video_signature": pipeline.video_signature(video)})
+        return video
+
     def test_parallel_completion_preserves_order_and_stops_at_exact_n(self):
         args = self.args("-N", "5", "--download-workers", "2")
         barrier = threading.Barrier(2)
@@ -223,6 +231,111 @@ class ParallelDownloadTests(PipelineFixture):
             pipeline.prepare(args)
             self.assertEqual(grouper.group_frames_by_token.call_count, 3)
             grouper.WhisperModel.assert_called_once()
+
+    def test_fully_cached_runs_skip_pools_copies_and_cache_writes(self):
+        args = self.args("-N", "3", "--download-workers", "32", "--alignment-workers", "32")
+        with self.alignment_fixture() as (grouper, _, download):
+            download.side_effect = self.seed_download
+            pipeline.prepare(args)
+            previous = args.manifest.read_bytes()
+            # Existing full-config markers remain reusable without migration.
+            marker = next(self.root.glob("frames/**/complete.json"))
+            saved = pipeline.read_cache(marker)
+            config = pipeline.read_cache(self.root / "alignment_configs" / f"{saved['config_key']}.json")
+            pipeline.write_json(marker, {"video_signature": saved["video_signature"], "config": config})
+            cached_files = [path for folder in ("clips", "frames", "alignment_configs")
+                            for path in (self.root / folder).rglob("*") if path.is_file()]
+            signatures = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in cached_files}
+            grouper.reset_mock()
+            download.reset_mock()
+            pipeline.training_record.reset_mock()
+            with patch.object(pipeline, "ThreadPoolExecutor", side_effect=AssertionError("cache created a pool")), \
+                    patch.object(pipeline.copy, "deepcopy", side_effect=AssertionError("cache copied a tokenizer")), \
+                    patch.object(pipeline.time, "monotonic", return_value=0), \
+                    patch.object(pipeline, "write_json", wraps=pipeline.write_json) as write:
+                pipeline.prepare(args)
+            download.assert_not_called()
+            grouper.WhisperModel.assert_not_called()
+            grouper.group_frames_by_token.assert_not_called()
+            grouper.write_jsonl.assert_not_called()
+            self.assertEqual(pipeline.training_record.call_count, 3)
+            self.assertEqual([call.args[0] for call in write.call_args_list], [self.root / "run_report.json"])
+            self.assertEqual(args.manifest.read_bytes(), previous)
+            self.assertEqual(signatures, {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in cached_files})
+            with patch.object(pipeline, "ThreadPoolExecutor", side_effect=AssertionError("pretrain cache created a pool")), \
+                    patch.object(pipeline, "load_grouper", side_effect=AssertionError("pretrain loaded alignment")):
+                pipeline.prepare(args, video_only=True)
+            self.assertEqual(len(self.records(args)), 3)
+
+    def test_completion_markers_store_large_tokenizer_configuration_only_once(self):
+        args = self.args("-N", "3")
+        with self.alignment_fixture() as (_, tokenizer, download):
+            download.side_effect = self.seed_download
+            pipeline.alignment_tokenizer.return_value = (tokenizer, "character", {"backend_json": "x" * 100_000}, None)
+            pipeline.prepare(args)
+        configs = list((self.root / "alignment_configs").glob("*.json"))
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(pipeline.read_cache(configs[0])["tokenizer"]["backend_json"], "x" * 100_000)
+        markers = list(self.root.glob("frames/**/complete.json"))
+        self.assertEqual(len(markers), 3)
+        for marker in markers:
+            self.assertLess(marker.stat().st_size, 1024)
+            self.assertEqual(pipeline.read_cache(marker)["config_key"], configs[0].stem)
+
+    def test_cached_fast_path_rechecks_signatures_and_repairs_missing_alignments(self):
+        args = self.args("-N", "3")
+        with self.alignment_fixture() as (grouper, _, download):
+            download.side_effect = self.seed_download
+            pipeline.prepare(args)
+            first = pipeline.cached_download(self.rows[0]["clip"], args)
+            first.write_bytes(b"changed video")
+            second_alignment = self.root / "frames" / self.rows[1]["clip"].key
+            next(second_alignment.glob("*/manifest.json")).unlink()
+            grouper.reset_mock()
+            download.reset_mock()
+            pipeline.prepare(args)
+            self.assertEqual(download.call_count, 2)  # Invalid video, plus cached video needing alignment.
+            self.assertEqual(grouper.group_frames_by_token.call_count, 2)
+            self.assertEqual(len(self.records(args)), 3)
+
+    def test_invalid_cached_alignment_is_reported_and_replaced(self):
+        args = self.args("-N", "3")
+        with self.alignment_fixture() as (_, _, download):
+            download.side_effect = self.seed_download
+            pipeline.prepare(args)
+            invalid = pipeline.cached_download(self.rows[0]["clip"], args)
+            validate = pipeline.training_record.side_effect
+
+            def reject_invalid(manifest, tokenizer, unit, video):
+                if video == invalid:
+                    raise ValueError("cached alignment is unusable")
+                return validate(manifest, tokenizer, unit, video)
+
+            pipeline.training_record.side_effect = reject_invalid
+            args.num_videos = 2
+            with patch.object(pipeline, "ThreadPoolExecutor", side_effect=AssertionError("cache created a pool")):
+                pipeline.prepare(args)
+        self.assertEqual([row["source_key"] for row in self.records(args)], ["tiktok:1", "tiktok:2"])
+        report = pipeline.read_cache(self.root / "run_report.json")
+        self.assertEqual((report["attempts"], report["usable"]), (3, 2))
+        self.assertIn("cached alignment is unusable", report["failures"][0]["error"])
+
+    def test_cached_run_report_checkpointed_periodically_and_on_completion(self):
+        args = self.args("-N", "3")
+        for row in self.rows[:3]:
+            self.seed_download(row["clip"], args)
+        writes = []
+        original = pipeline.write_json
+
+        def checkpoint(path, value):
+            if path.name == "pretrain_report.json":
+                writes.append((value["usable"], len(value["results"])))
+            original(path, value)
+
+        with patch.object(pipeline.time, "monotonic", side_effect=[0, .2, 1.2, 1.2, 1.3]), \
+                patch.object(pipeline, "write_json", side_effect=checkpoint):
+            pipeline.prepare(args, video_only=True)
+        self.assertEqual(writes, [(2, 2), (3, 3)])
 
     def test_alignment_failure_replaced_without_exceeding_remaining_clip_budget(self):
         args = self.args("-N", "2", "--alignment-workers", "4", "--max-attempts", "3")

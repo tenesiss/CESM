@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import warnings
 import zipfile
 from collections import deque
@@ -848,13 +849,34 @@ def download_candidate(clip, args, row):
     return download_clip(clip, args)
 
 
-def prefetched_clips(args, report, records, excluded, languages, *, reserved=lambda: 0):
+@dataclass(frozen=True)
+class CachedPreparation:
+    record: dict
+    output: Path
+
+
+def prefetched_clips(args, report, records, excluded, languages, *, reserved=lambda: 0, reuse=None):
     """Bound outstanding transfers by workers, remaining clips and the attempt budget.
 
     Futures are consumed in source order. Account for clips already handed to
     alignment so both queues share the usable-clip budget. On exit, join transfers
     before closing the source or letting a subsequent preparation pass start.
     """
+    def cached_future(clip):
+        if reuse is None:
+            return None
+        result = Future()
+        try:
+            cached = reuse(clip)
+            if cached is None:
+                return None
+            result.set_result(cached)
+        except Exception as exc:
+            # Invalid cached data is still an attempted candidate; let the
+            # coordinator record the failure just like a failed worker job.
+            result.set_exception(exc)
+        return result
+
     workers = args.download_workers if args.dataset in ("hdtf", "shofo") else 1
     with contextlib.closing(eligible_clips(args, report, excluded, languages)) as rows:
         if workers == 1:
@@ -863,9 +885,9 @@ def prefetched_clips(args, report, records, excluded, languages, *, reserved=lam
                 if candidate is None:
                     break
                 report["attempts"] += 1
-                yield (*candidate, report["attempts"], None)
+                yield (*candidate, report["attempts"], cached_future(candidate[2]))
             return
-        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="downvid")
+        pool = None
         pending = deque()
         exhausted = False
         try:
@@ -881,13 +903,23 @@ def prefetched_clips(args, report, records, excluded, languages, *, reserved=lam
                         break
                     index, row, clip = candidate
                     report["attempts"] += 1
-                    future = pool.submit(download_candidate, clip, args, row)
+                    future = cached_future(clip)
+                    reused = future is not None
+                    if future is None:
+                        if pool is None:
+                            pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="downvid")
+                        future = pool.submit(download_candidate, clip, args, row)
                     pending.append((index, row, clip, report["attempts"], future))
+                    if reused and len(pending) == 1:
+                        # Return a cached head immediately: high worker counts
+                        # must not force a large lookahead before reporting it.
+                        break
                 if not pending:
                     break
                 yield pending.popleft()
         finally:
-            pool.shutdown(wait=True, cancel_futures=True)
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
 
 
 def alignment_worker_count(args, *, video_only=False):
@@ -907,6 +939,7 @@ class ClipAligner:
         self.lock = threading.Lock()
         self.whisper = None
         self.setup_error = None
+        self.config_saved = False
 
     def resources(self, *, model=False):
         # Initialize once, lazily: fully cached runs do not load Whisper. Remember
@@ -933,41 +966,78 @@ class ClipAligner:
                     raise WhisperSetupError(self.setup_error) from exc
             return self.local.tokenizer, self.whisper
 
+    def reuse(self, clip, video):
+        """Validate a completed alignment without model/tokenizer clones or writes."""
+        if self.args.reprocess:
+            return None
+        output = self.args.work_dir / "frames" / clip.key / self.config_key
+        cached = read_cache(output / "complete.json")
+        if (not cached or cached.get("video_signature") != video_signature(video) or
+                cached.get("config_key", self.config_key) != self.config_key):
+            return None
+        manifest = read_cache(output / "manifest.json")
+        if not manifest:
+            return None
+        # The original tokenizer is used only for cache validation. Protect it
+        # from being copied by a newly started alignment worker at the same time.
+        with self.lock:
+            record = training_record(manifest, self.tokenizer, self.unit, video)
+        record["source_key"] = clip.source_key
+        return CachedPreparation(record, output)
+
     def __call__(self, clip, video):
+        cached = self.reuse(clip, video)
+        if cached is not None:
+            print(f"  Reusing alignment: {cached.output}", flush=True)
+            return cached.record, cached.output
         args, grouper = self.args, self.grouper
         output = args.work_dir / "frames" / clip.key / self.config_key
-        completed = output / "complete.json"
         signature = video_signature(video)
-        cached = read_cache(completed) if not args.reprocess else None
-        manifest = read_cache(output / "manifest.json")
-        if cached and cached.get("video_signature") == signature and manifest:
-            print(f"  Reusing alignment: {output}", flush=True)
-            tokenizer, _ = self.resources()
-        else:
-            tokenizer, whisper = self.resources(model=True)
-            # A clip key is scheduled only once, so each worker owns its output.
-            if output.exists():
-                shutil.rmtree(output)
-            print(f"  Transcribing and grouping frames: {video}", flush=True)
-            manifest = grouper.group_frames_by_token(
-                video, tokenizer, output, whisper_model=args.whisper_model,
-                language=args.language, device=args.whisper_device,
-                compute_type=args.whisper_compute_type, image_ext=args.image_ext,
-                jpeg_quality=args.jpeg_quality, whisper_instance=whisper,
-            )
+        tokenizer, whisper = self.resources(model=True)
+        # A clip key is scheduled only once, so each worker owns its output.
+        if output.exists():
+            shutil.rmtree(output)
+        print(f"  Transcribing and grouping frames: {video}", flush=True)
+        manifest = grouper.group_frames_by_token(
+            video, tokenizer, output, whisper_model=args.whisper_model,
+            language=args.language, device=args.whisper_device,
+            compute_type=args.whisper_compute_type, image_ext=args.image_ext,
+            jpeg_quality=args.jpeg_quality, whisper_instance=whisper,
+        )
         record = training_record(manifest, tokenizer, self.unit, video)
         record["source_key"] = clip.source_key
         grouper.write_jsonl([record], output / "data.jsonl")
-        write_json(completed, {"video_signature": signature, "config": self.config})
+        with self.lock:
+            if not self.config_saved:
+                config_path = args.work_dir / "alignment_configs" / f"{self.config_key}.json"
+                if not config_path.is_file():
+                    write_json(config_path, self.config)
+                self.config_saved = True
+        # Pretrained tokenizer state can be large; store it once per configuration
+        # rather than duplicating it in every clip's completion marker.
+        write_json(output / "complete.json", {"video_signature": signature, "config_key": self.config_key})
         return record, output
 
 
 def prepared_clips(args, report, records, excluded, languages, aligner=None):
     """Overlap two bounded stages, yielding completed preparation in source order."""
+    def reuse(clip):
+        video = cached_download(clip, args)
+        if video is None:
+            return None
+        cached = (CachedPreparation({"video": str(video.resolve())}, video.parent)
+                  if aligner is None else aligner.reuse(clip, video))
+        if cached is not None:
+            print(f"  Reusing download: {video}", flush=True)
+            if aligner is not None:
+                print(f"  Reusing alignment: {cached.output}", flush=True)
+        return cached
+
     workers = report["alignment_workers"]
     pending = deque()
-    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="alignment") if workers > 1 else None
-    downloads = prefetched_clips(args, report, records, excluded, languages, reserved=lambda: len(pending))
+    pool = None
+    downloads = prefetched_clips(args, report, records, excluded, languages,
+                                reserved=lambda: len(pending), reuse=reuse)
     exhausted = halted = False
     fatal_errors = (AlignmentSetupError, DownloadSetupError, ArchiveAccessError, ShofoAccessError)
     try:
@@ -985,11 +1055,15 @@ def prepared_clips(args, report, records, excluded, languages, aligner=None):
                 result = Future()
                 try:
                     video = download.result() if download is not None else download_candidate(clip, args, row)
-                    if aligner is None:
+                    if isinstance(video, CachedPreparation):
+                        result.set_result((video.record, video.output))
+                    elif aligner is None:
                         result.set_result(({"video": str(video.resolve())}, video.parent))
-                    elif pool is None:
+                    elif workers <= 1:
                         result.set_result(aligner(clip, video))
                     else:
+                        if pool is None:
+                            pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="alignment")
                         result = pool.submit(aligner, clip, video)
                 except Exception as exc:
                     result.set_exception(exc)
@@ -1000,6 +1074,8 @@ def prepared_clips(args, report, records, excluded, languages, aligner=None):
                         # clips from the dead upload before requesting the next row.
                         report["unavailable_sources"][clip.source_key] = str(exc)
                 pending.append((index, row, clip, attempt, result))
+                if result.done() and len(pending) == 1:
+                    break
             if not pending:
                 break
             yield pending.popleft()
@@ -1051,6 +1127,7 @@ def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
     partial = args.manifest.with_name(args.manifest.name + ".partial")
     print(f"Reading {args.dataset} source: {source}", flush=True)
+    next_report = time.monotonic() + 1
     try:
         candidates = prepared_clips(args, report, records, excluded, languages, aligner)
         with partial.open("w", encoding="utf-8") as jsonl, contextlib.closing(candidates) as rows:
@@ -1078,7 +1155,13 @@ def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
                         report["unavailable_sources"][clip.source_key] = str(exc)
                         print("  Source unavailable; skipping its remaining clips this run", flush=True)
                     print(f"  Skipping clip: {exc}", file=sys.stderr, flush=True)
-                write_json(report_path, report)
+                # Rewriting an ever-growing report per cached clip makes a fast
+                # resume quadratic. The JSONL stays flushed per clip; checkpoint
+                # the report once per second and always write the final state.
+                if time.monotonic() >= next_report:
+                    report["usable"] = len(records)
+                    write_json(report_path, report)
+                    next_report = time.monotonic() + 1
         if len(records) != args.num_videos:
             raise RuntimeError(
                 f"Only {len(records)}/{args.num_videos} usable clips after {report['attempts']} attempts. "
