@@ -927,6 +927,8 @@ def training_command(args):
 
 
 def validate_args(parser, args):
+    import train
+
     if args.num_videos is None and not (args.num_pretrain is not None and args.prepare_only):
         parser.error("--num-videos/-N is required except with --login, --logout, or --N-pretrain --prepare-only")
     args.work_dir = (args.work_dir or ROOT / "data" / args.dataset).expanduser().resolve()
@@ -958,8 +960,10 @@ def validate_args(parser, args):
         parser.error("--pretrain-visual-encoder requires --N-pretrain or --pretrain-manifest")
     if args.pretrain_visual_encoder and args.confidence_only:
         parser.error("--pretrain-visual-encoder cannot be combined with --confidence-only")
-    if args.pretrain_epochs <= 0 or args.pretrain_adjacent_frames < 2:
-        parser.error("--pretrain-epochs must be > 0 and --pretrain-adjacent-frames must be >= 2")
+    try:
+        train.validate_pretraining_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     args.group_frames_code = args.group_frames_code.expanduser().resolve()
     if args.group_frames_code.is_dir():
         args.group_frames_code /= "group_video_frames_by_token.py"

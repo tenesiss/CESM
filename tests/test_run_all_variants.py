@@ -199,6 +199,12 @@ class AllVariantRunnerTests(unittest.TestCase):
             ["-N", "1", "--pretrain-visual-encoder"],
             ["-N", "1", "--N-pretrain", "2", "--pretrain-epochs", "0"],
             ["-N", "1", "--N-pretrain", "2", "--pretrain-adjacent-frames", "1"],
+            ["-N", "1", "--lambda-pretrain-temporal", "-1"],
+            ["-N", "1", "--lambda-pretrain-augmentation", "nan"],
+            ["-N", "1", "--lambda-pretrain-variance", "inf"],
+            ["-N", "1", "--lambda-pretrain-covariance", "-1"],
+            ["-N", "1", "--pretrain-variance-floor", "0"],
+            ["-N", "1", "--variant-args", "1:--pretrain-variance-floor nan"],
             ["-N", "1", "--variant-args", "1:--pretrain-manifest other.jsonl"],
         ):
             with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -211,6 +217,10 @@ class AllVariantRunnerTests(unittest.TestCase):
                     "-N", "2", "--N-pretrain", "7", "--N-valid", "3", "--dataset", dataset,
                     "--variants", "1", "5", "--pretrain-epochs", "2", "--pretrain-adjacent-frames", "4",
                     "--pretrained-lm", "model", "--download-max-frames", "20",
+                    "--lambda-pretrain-temporal", "0.2", "--lambda-pretrain-augmentation", "3",
+                    "--lambda-pretrain-variance", "4", "--lambda-pretrain-covariance", "0.5",
+                    "--pretrain-variance-floor", "0.8",
+                    "--variant-args", "5:--lambda-pretrain-covariance 0.7 --pretrain-variance-floor 0.9",
                 ])
                 self.assertEqual([s["name"] for s in stages[:3]],
                                  ["download", "download_validation", "download_pretrain"])
@@ -228,6 +238,10 @@ class AllVariantRunnerTests(unittest.TestCase):
                         self.assertTrue(parsed.pretrain_visual_encoder)
                         self.assertEqual(parsed.pretrain_manifest, str(self.root / "run" / "pretrain_samples.jsonl"))
                         self.assertEqual((parsed.pretrain_epochs, parsed.pretrain_adjacent_frames), (2, 4))
+                        self.assertEqual((parsed.lambda_pretrain_temporal, parsed.lambda_pretrain_augmentation,
+                                          parsed.lambda_pretrain_variance), (0.2, 3, 4))
+                        expected = (0.7, 0.9) if stage["name"] == "train_5" else (0.5, 0.8)
+                        self.assertEqual((parsed.lambda_pretrain_covariance, parsed.pretrain_variance_floor), expected)
 
     def test_reused_pretraining_manifest_is_snapshotted_and_excluded_from_validation(self):
         for name in ("train", "pretrain", "valid"):

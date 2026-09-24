@@ -152,6 +152,7 @@ def variant_overrides(parser, specifications):
 def validate_training_args(parser, args):
     try:
         train.validate_early_stopping_args(args)
+        train.validate_pretraining_args(args)
         train.accuracy_decode_args(args)
     except ValueError as exc:
         parser.error(str(exc))
@@ -159,8 +160,6 @@ def validate_training_args(parser, args):
         parser.error("Each variant requires --epochs > 0 and --confidence-epochs >= 0")
     if args.pretrain_visual_encoder and not args.pretrain_manifest:
         parser.error("--pretrain-visual-encoder requires --N-pretrain or --pretrain-manifest")
-    if args.pretrain_epochs <= 0 or args.pretrain_adjacent_frames < 2:
-        parser.error("--pretrain-epochs must be > 0 and --pretrain-adjacent-frames must be >= 2")
     if args.batch_size <= 0 or args.workers < 0:
         parser.error("--batch-size must be > 0 and --workers must be >= 0")
     if args.max_frames is not None and args.max_frames <= 0:

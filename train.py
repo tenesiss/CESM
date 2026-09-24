@@ -40,7 +40,8 @@ Training has two stages:
      document's log-sum-exp aggregation).
 
 Optionally, --pretrain-visual-encoder first trains the video encoder on an
-unannotated --pretrain-manifest using temporal and augmented-view MSE.
+unannotated --pretrain-manifest using augmented-view MSE, variance and covariance
+regularization, and optional temporal MSE.
 
 The supplied frame windows are also used as causal supervision: target token t
 may only cross-attend to frames up through the end of its own window. The
@@ -1951,6 +1952,37 @@ def augmentation_visual_loss(z1: torch.Tensor, z2: torch.Tensor, lengths: torch.
     return errors.sum() / valid.sum().clamp_min(1)
 
 
+def visual_variance_covariance_losses(
+    z: torch.Tensor, lengths: torch.Tensor, variance_floor: float = 1.0, *,
+    compute_variance: bool = True, compute_covariance: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """VICReg statistics over valid frames pooled across clips, in FP32.
+
+    Use sample variance/covariance (N-1 denominator). Fewer than two valid
+    frames cannot estimate diversity, so both terms are differentiable zeros.
+    The floor is a per-feature standard-deviation target, not a variance target.
+    """
+    valid = torch.arange(z.shape[1], device=z.device)[None, :] < lengths[:, None]
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        features = z[valid].float()
+        zero = features[:0].sum()
+        variance, covariance = zero, zero
+        if features.shape[0] < 2:
+            return variance, covariance
+        if compute_variance:
+            # Scale epsilon down for very small floors so a constant embedding
+            # still incurs a penalty. The usual floor=1 uses VICReg's 1e-4.
+            eps = min(1e-4, (0.01 * variance_floor) ** 2)
+            std = torch.sqrt(features.var(dim=0) + eps)
+            variance = F.relu(variance_floor - std).mean()
+        if compute_covariance:
+            centered = features - features.mean(dim=0)
+            cov = (centered.T @ centered) / (features.shape[0] - 1)
+            diagonal = torch.eye(cov.shape[0], dtype=torch.bool, device=cov.device)
+            covariance = cov.masked_fill(diagonal, 0).square().sum() / cov.shape[0]
+    return variance, covariance
+
+
 @torch.no_grad()
 def augment_pretrain_video(video: torch.Tensor, lengths: torch.Tensor,
                            original_probability: float = 0.2) -> torch.Tensor:
@@ -1989,14 +2021,39 @@ def augment_pretrain_video(video: torch.Tensor, lengths: torch.Tensor,
 
 
 def visual_pretraining_losses(encoder: VideoEncoder, batch: dict,
-                             adjacent_frames: int = 2) -> Dict[str, torch.Tensor]:
+                             adjacent_frames: int = 2, *,
+                             lambda_temporal: float = 0.0,
+                             lambda_augmentation: float = 1.0,
+                             lambda_variance: float = 1.0,
+                             lambda_covariance: float = 0.04,
+                             variance_floor: float = 1.0) -> Dict[str, torch.Tensor]:
+    """Weighted losses on final encoder states; disabled terms report zero."""
     video, lengths = batch["video"], batch["video_lengths"]
-    # z is the final video representation, after the temporal stack and norm.
-    temporal = temporal_visual_loss(encoder(video, lengths), lengths, adjacent_frames)
+    # Avoid the third encoder pass when temporal smoothing is disabled.
+    temporal = (temporal_visual_loss(encoder(video, lengths), lengths, adjacent_frames)
+                if lambda_temporal else None)
     z1 = encoder(augment_pretrain_video(video, lengths), lengths)
     z2 = encoder(augment_pretrain_video(video, lengths), lengths)
-    augmentation = augmentation_visual_loss(z1, z2, lengths)
-    return {"total": temporal + augmentation, "temporal": temporal, "augmentation": augmentation}
+    zero = z1[:, :0].float().sum() + z2[:, :0].float().sum()
+    if temporal is None:
+        temporal = zero
+    augmentation = augmentation_visual_loss(z1, z2, lengths) if lambda_augmentation else zero
+    variance, covariance = zero, zero
+    if lambda_variance or lambda_covariance:
+        v1, c1 = visual_variance_covariance_losses(
+            z1, lengths, variance_floor,
+            compute_variance=bool(lambda_variance), compute_covariance=bool(lambda_covariance),
+        )
+        v2, c2 = visual_variance_covariance_losses(
+            z2, lengths, variance_floor,
+            compute_variance=bool(lambda_variance), compute_covariance=bool(lambda_covariance),
+        )
+        variance = (v1 + v2) / 2
+        covariance = c1 + c2
+    total = (lambda_temporal * temporal + lambda_augmentation * augmentation
+             + lambda_variance * variance + lambda_covariance * covariance)
+    return {"total": total, "temporal": temporal, "augmentation": augmentation,
+            "variance": variance, "covariance": covariance}
 
 
 def similarity_preservation_loss(x: torch.Tensor, y: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -3096,7 +3153,7 @@ def pretrain_visual_encoder(model, loader, tokenizer, device, args, *, token_epo
             epoch = args.pretrain_epoch + 1
             model.eval()
             model.video_encoder.train()
-            sums = {"total": 0.0, "temporal": 0.0, "augmentation": 0.0}
+            sums = {key: 0.0 for key in ("total", "temporal", "augmentation", "variance", "covariance")}
             n = 0
             for batch in loader:
                 opt.zero_grad(set_to_none=True)
@@ -3104,6 +3161,11 @@ def pretrain_visual_encoder(model, loader, tokenizer, device, args, *, token_epo
                     batch = move_batch(batch, device)
                     losses = visual_pretraining_losses(
                         model.video_encoder, batch, args.pretrain_adjacent_frames,
+                        lambda_temporal=args.lambda_pretrain_temporal,
+                        lambda_augmentation=args.lambda_pretrain_augmentation,
+                        lambda_variance=args.lambda_pretrain_variance,
+                        lambda_covariance=args.lambda_pretrain_covariance,
+                        variance_floor=args.pretrain_variance_floor,
                     )
                 scaler.scale(losses["total"]).backward()
                 scaler.unscale_(opt)
@@ -3117,7 +3179,7 @@ def pretrain_visual_encoder(model, loader, tokenizer, device, args, *, token_epo
                 if args.log_every and global_step % args.log_every == 0:
                     msg = " ".join(f"{key}={value / n:.4f}" for key, value in sums.items())
                     print(f"pretrain epoch={epoch} step={global_step} {msg}")
-                losses = None  # Release all three forward graphs before the next batch.
+                losses = None  # Release the forward graphs before the next batch.
             if n == 0:
                 raise ValueError("No videos were available for visual pretraining")
             args.pretrain_epoch = epoch
@@ -3133,17 +3195,29 @@ def pretrain_visual_encoder(model, loader, tokenizer, device, args, *, token_epo
             module.training = mode
 
 
+def validate_pretraining_args(args) -> None:
+    """Shared validation for the trainer, downloader, and variant runner."""
+    if args.pretrain_epochs <= 0:
+        raise ValueError("--pretrain-epochs must be > 0")
+    if args.pretrain_adjacent_frames < 2:
+        raise ValueError("--pretrain-adjacent-frames must be >= 2")
+    for name in ("lambda_pretrain_temporal", "lambda_pretrain_augmentation",
+                 "lambda_pretrain_variance", "lambda_pretrain_covariance"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and >= 0")
+    if not math.isfinite(args.pretrain_variance_floor) or args.pretrain_variance_floor <= 0:
+        raise ValueError("--pretrain-variance-floor must be finite and > 0")
+
+
 def train(args) -> None:
     validate_early_stopping_args(args)
+    validate_pretraining_args(args)
     accuracy_decode_args(args)
     if args.pretrain_manifest and not args.pretrain_visual_encoder:
         raise ValueError("--pretrain-manifest requires --pretrain-visual-encoder")
     if args.pretrain_visual_encoder and not args.pretrain_manifest:
         raise ValueError("--pretrain-visual-encoder requires --pretrain-manifest")
-    if args.pretrain_epochs <= 0:
-        raise ValueError("--pretrain-epochs must be > 0")
-    if args.pretrain_adjacent_frames < 2:
-        raise ValueError("--pretrain-adjacent-frames must be >= 2")
     if args.pretrain_visual_encoder and args.confidence_only:
         raise ValueError("--pretrain-visual-encoder cannot be combined with --confidence-only")
     metrics_path = None
@@ -3637,13 +3711,23 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--output", default="unnoba.pt")
     p.add_argument("--pretrain-visual-encoder", action="store_true",
-                   help="Pretrain the full video encoder with temporal and augmentation MSE before token training")
+                   help="Pretrain the full video encoder with VICReg-style losses and optional temporal MSE")
     p.add_argument("--pretrain-manifest", default=None,
                    help="Pretraining JSONL with video paths; text/windows are optional and ignored")
     p.add_argument("--pretrain-epochs", type=int, default=5,
                    help="Additional visual pretraining epochs when enabled (default: 5); uses --lr and --weight-decay")
     p.add_argument("--pretrain-adjacent-frames", type=int, default=2, metavar="N",
                    help="Compare each valid frame pair with 0 < j-i < N once (default: 2, consecutive pairs)")
+    p.add_argument("--lambda-pretrain-temporal", type=float, default=0.0,
+                   help="Pretraining temporal MSE weight (default: 0; disabled)")
+    p.add_argument("--lambda-pretrain-augmentation", type=float, default=1.0,
+                   help="Pretraining augmented-view MSE weight (default: 1)")
+    p.add_argument("--lambda-pretrain-variance", type=float, default=1.0,
+                   help="Pretraining variance-floor weight, averaged over both views (default: 1)")
+    p.add_argument("--lambda-pretrain-covariance", type=float, default=0.04,
+                   help="Pretraining off-diagonal covariance weight, summed over both views (default: 0.04)")
+    p.add_argument("--pretrain-variance-floor", type=float, default=1.0,
+                   help="Target minimum per-feature standard deviation across valid frames (default: 1; must be > 0)")
     p.add_argument("--validation-manifest", default=None,
                    help="Separate validation JSONL; enables best-checkpoint selection and early stopping")
     p.add_argument("--early-stopping-patience", type=int, default=5,

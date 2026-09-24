@@ -470,6 +470,19 @@ class DownloadFrameLimitIntegrationTests(PipelineFixture):
 
 
 class PretrainingPreparationTests(PipelineFixture):
+    def test_invalid_loss_parameters_fail_before_download_dependencies(self):
+        for flag, value in (("--lambda-pretrain-temporal", "-1"),
+                            ("--lambda-pretrain-augmentation", "nan"),
+                            ("--lambda-pretrain-variance", "inf"),
+                            ("--lambda-pretrain-covariance", "-1"),
+                            ("--pretrain-variance-floor", "0")):
+            parser = pipeline.build_argparser()
+            args = parser.parse_args(["--N-pretrain", "1", "--prepare-only", flag, value])
+            with self.subTest(flag=flag), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit), patch.object(pipeline, "validate_download_runtimes") as runtimes:
+                pipeline.validate_args(parser, args)
+            runtimes.assert_not_called()
+
     def test_positive_count_and_video_only_validation_skip_alignment_dependencies(self):
         for count in ("0", "-1", "1.5"):
             with self.subTest(count=count), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -554,13 +567,19 @@ class PretrainingPreparationTests(PipelineFixture):
                 patch.object(pipeline, "prepare", side_effect=prepare), \
                 patch.object(pipeline.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
             pipeline.main(["-N", "2", "--N-pretrain", "5", "--work-dir", str(self.root),
-                           "--pretrain-epochs", "3", "--pretrain-adjacent-frames", "4"])
+                           "--pretrain-epochs", "3", "--pretrain-adjacent-frames", "4",
+                           "--lambda-pretrain-temporal", "0.2", "--lambda-pretrain-augmentation", "3",
+                           "--lambda-pretrain-variance", "4", "--lambda-pretrain-covariance", "0.5",
+                           "--pretrain-variance-floor", "0.8"])
         self.assertEqual(preparations, [(2, str(self.root / "data.jsonl"), False),
                                         (5, str(self.root / "pretrain.jsonl"), True)])
         forwarded = train.build_argparser().parse_args(commands[-1][2:])
         self.assertTrue(forwarded.pretrain_visual_encoder)
         self.assertEqual(forwarded.pretrain_manifest, str(self.root / "pretrain.jsonl"))
         self.assertEqual((forwarded.pretrain_epochs, forwarded.pretrain_adjacent_frames), (3, 4))
+        self.assertEqual((forwarded.lambda_pretrain_temporal, forwarded.lambda_pretrain_augmentation,
+                          forwarded.lambda_pretrain_variance, forwarded.lambda_pretrain_covariance,
+                          forwarded.pretrain_variance_floor), (0.2, 3, 4, 0.5, 0.8))
         self.assertFalse(any(flag.startswith("--N-pretrain") for flag in commands[-1]))
 
 

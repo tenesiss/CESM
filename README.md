@@ -196,6 +196,11 @@ python3 train.py \
   --pretrain-manifest data/unlabeled.jsonl \
   --pretrain-epochs 5 \
   --pretrain-adjacent-frames 2 \
+  --lambda-pretrain-temporal 0 \
+  --lambda-pretrain-augmentation 1 \
+  --lambda-pretrain-variance 1 \
+  --lambda-pretrain-covariance 0.04 \
+  --pretrain-variance-floor 1 \
   --max-frames 256 \
   --output checkpoints/cesm.pt
 ```
@@ -206,7 +211,28 @@ ignored. Pretraining videos must be disjoint from `--validation-manifest`,
 including source uploads when `source_key` is provided.
 
 For the final per-frame video representations (after the temporal stack and
-output normalization), the loss is the sum of two equally weighted terms:
+output normalization), pretraining uses a VICReg-style weighted objective:
+
+```text
+total = lambda_pretrain_temporal * temporal
+      + lambda_pretrain_augmentation * augmentation
+      + lambda_pretrain_variance * variance
+      + lambda_pretrain_covariance * covariance
+```
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `--lambda-pretrain-temporal` | `0` | Weight of temporal MSE; disabled initially to preserve mouth transitions. |
+| `--lambda-pretrain-augmentation` | `1` | Weight of MSE between the two augmented views. |
+| `--lambda-pretrain-variance` | `1` | Weight of the per-feature standard-deviation floor penalty. |
+| `--lambda-pretrain-covariance` | `0.04` | Weight of the off-diagonal covariance penalty. |
+| `--pretrain-variance-floor` | `1` | Target minimum **standard deviation**, despite the parameter's name. |
+
+Weights must be finite and nonnegative; zero disables a term. The floor must be
+finite and positive. These settings work in `train.py`, the download wrappers,
+all five variant scripts, and `run_all_variants.py`, including per-variant overrides.
+
+The component losses are:
 
 - Temporal MSE: average feature MSE over all valid pairs `(i,j)` with
   `0 < j-i < N`, where `N = --pretrain-adjacent-frames` (at least 2). The default
@@ -217,12 +243,37 @@ output normalization), the loss is the sum of two equally weighted terms:
   contrast factors from `[0.8,1.2]` and rotation from `[-5,5]` degrees, with a 20%
   chance per frame of keeping the exact original image. Views are resampled
   every step; padded frames contribute no loss.
+- Variance: for each view separately, pool valid frames across clips into an
+  `[N,D]` matrix and compute sample variance per feature. Penalize
+  `mean(relu(floor - sqrt(sample_variance + eps)))`, then average the two
+  view penalties. `eps = min(1e-4, (0.01 * floor)^2)` stabilizes gradients while
+  retaining a positive collapse penalty even for small floors.
+- Covariance: center each view's `[N,D]` matrix, compute
+  `C = centered.T @ centered / (N-1)`, and penalize
+  `sum(C[i,j]^2 for i != j) / D`. Sum the two view penalties. Covariance alone
+  permits constant outputs; the variance term supplies the collapse penalty.
+
+Variance/covariance statistics run in FP32 even under AMP and exclude padding
+before any arithmetic. Both penalties are skipped when a batch has fewer than
+two valid frames. Disabled terms are logged as zero; disabling temporal MSE
+also skips the clean-video encoder pass. Console logs show each unweighted
+component and the weighted total. No projection head or additional inference
+parameters are introduced.
+
+The defaults preserve the relative weights in
+[VICReg](https://arxiv.org/abs/2105.04906), dividing its `25,25,1` coefficients
+by 25 to give `1,1,0.04`, and apply them to final video features.
+They are starting points: correlated frames provide fewer independent
+observations than the frame count suggests, and feature variation can still
+come from frame positions or speaker appearance. Evaluate downstream
+transcription quality as well as representation diversity.
 
 Only the video encoder is updated in this stage. It uses `--lr`,
 `--weight-decay`, `--grad-clip`, `--batch-size`, and `--amp`; pretraining defaults
 to five epochs. `--max-frames` also bounds pretraining sections, and temporal
-pairs stay within each section. These are the two MSE objectives only; no
-variance or contrastive objective is added to prevent constant representations.
+pairs stay within each section. To reproduce the former two-MSE objective, set
+the temporal and augmentation weights to `1` and the variance and covariance
+weights to `0`.
 
 To save after pretraining without running the supervised stages, add
 `--epochs 0 --confidence-epochs 0`. The aligned `--manifest` is still required
@@ -230,7 +281,9 @@ to initialize the supervised tokenizer for the checkpoint. Resume with
 `--resume checkpoints/cesm.pt`; omitting both pretraining flags starts supervised
 training directly, while including them runs additional pretraining epochs.
 The checkpoint preserves the cumulative `pretrain_epoch` count. Changing the
-video encoder clears any previously trained confidence status.
+video encoder clears any previously trained confidence status. All four weights
+and the variance floor are recorded in `training_args`; pass custom settings
+again when resuming, since pretraining uses the current command's values.
 
 For download workflows, `--N-pretrain` sets the number of pretraining videos
 independently of `-N`, which still counts aligned supervised clips. It enables
@@ -461,7 +514,7 @@ per-sample metrics after training with the base `train.py`.
 `train.py`, the variant scripts, and `run_all_variants.py` save
 `CHECKPOINT_STEM.learning.png` and `CHECKPOINT_STEM.learning.csv` beside each
 checkpoint after every token/confidence epoch. Visual pretraining reports its
-MSE losses in the console and is not included in these curves.
+component losses in the console and is not included in these curves.
 All four curves are enabled by default: training loss, validation loss, training
 accuracy, and validation accuracy. Validation
 curves require `--validation-manifest` (or `--N-valid` in the runner); they are

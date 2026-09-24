@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -60,6 +60,108 @@ class VisualPretrainingLossTests(unittest.TestCase):
         loss = train.temporal_visual_loss(z, torch.tensor([2]))
         self.assertEqual(loss.dtype, torch.float32)
         self.assertEqual(loss.item(), 360000)
+
+    def test_variance_and_covariance_distinguish_collapse_redundancy_and_diversity(self):
+        lengths = torch.tensor([4])
+        collapsed = torch.tensor([[[2., -3.]] * 4])
+        redundant = torch.tensor([[[-1., -1.], [-1., -1.], [1., 1.], [1., 1.]]])
+        diverse = torch.tensor([[[-1., -1.], [-1., 1.], [1., -1.], [1., 1.]]])
+        variance, covariance = train.visual_variance_covariance_losses(collapsed, lengths)
+        self.assertAlmostEqual(variance.item(), 0.99, places=6)
+        self.assertEqual(covariance.item(), 0)
+        variance, covariance = train.visual_variance_covariance_losses(redundant, lengths)
+        self.assertEqual(variance.item(), 0)
+        self.assertAlmostEqual(covariance.item(), 16 / 9, places=6)
+        variance, covariance = train.visual_variance_covariance_losses(diverse, lengths)
+        self.assertEqual(variance.item(), 0)
+        self.assertEqual(covariance.item(), 0)
+        # A small user-selected floor must not be swallowed by numerical epsilon.
+        variance, _ = train.visual_variance_covariance_losses(collapsed, lengths, 0.001)
+        self.assertGreater(variance.item(), 0)
+
+    def test_statistics_pool_valid_frames_mask_padding_and_match_sample_covariance(self):
+        z = torch.tensor([[[-1., -1.], [0., 0.]], [[1., 1.], [float("nan"), float("nan")]]],
+                         requires_grad=True)
+        lengths = torch.tensor([2, 1])
+        variance, covariance = train.visual_variance_covariance_losses(z, lengths, 2)
+        self.assertAlmostEqual(variance.item(), 2 - (1 + 1e-4) ** 0.5, places=6)
+        self.assertAlmostEqual(covariance.item(), 1, places=6)
+        shifted = train.visual_variance_covariance_losses(z + 10, lengths, 2)
+        torch.testing.assert_close((variance, covariance), shifted)
+        (variance + covariance).backward()
+        self.assertTrue(torch.isfinite(z.grad).all())
+        self.assertGreater(z.grad[0].abs().sum().item(), 0)
+        self.assertEqual(z.grad[1, 1].abs().sum().item(), 0)
+
+    def test_variance_gradient_expands_nearly_collapsed_features(self):
+        z = torch.tensor([[[-0.1], [0.1]]], requires_grad=True)
+        variance, covariance = train.visual_variance_covariance_losses(z, torch.tensor([2]))
+        variance.backward()
+        self.assertGreater(z.grad[0, 0, 0].item(), 0)
+        self.assertLess(z.grad[0, 1, 0].item(), 0)
+        self.assertEqual(covariance.item(), 0)  # A single feature has no off-diagonal entries.
+
+    def test_statistics_skip_batches_with_fewer_than_two_valid_frames(self):
+        for length in (0, 1):
+            with self.subTest(length=length):
+                z = torch.tensor([[[3., 4.], [float("nan"), float("nan")]]], requires_grad=True)
+                variance, covariance = train.visual_variance_covariance_losses(z, torch.tensor([length]))
+                self.assertEqual(variance.item(), 0)
+                self.assertEqual(covariance.item(), 0)
+                (variance + covariance).backward()
+                torch.testing.assert_close(z.grad, torch.zeros_like(z))
+
+    def test_statistics_remain_fp32_under_autocast(self):
+        z = torch.tensor([[[-300., -300.], [300., 300.]]], dtype=torch.float16, requires_grad=True)
+        lengths = torch.tensor([2])
+        expected = train.visual_variance_covariance_losses(z.float(), lengths, 500)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual = train.visual_variance_covariance_losses(z, lengths, 500)
+        for result in actual:
+            self.assertEqual(result.dtype, torch.float32)
+            self.assertTrue(torch.isfinite(result))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertAlmostEqual(actual[1].item() / 180000 ** 2, 1, places=6)
+
+    def test_weighted_objective_aggregates_views_and_backpropagates_to_each_pass(self):
+        clean = torch.tensor([[[0., 0.], [2., 2.]]], requires_grad=True)
+        z1 = torch.tensor([[[-1., -1.], [1., 1.]]], requires_grad=True)
+        z2 = torch.tensor([[[-2., -2.], [2., 2.]]], requires_grad=True)
+        encoder = Mock(side_effect=[clean, z1, z2])
+        batch = {"video": torch.zeros(1, 2, 3, 8, 8), "video_lengths": torch.tensor([2])}
+        losses = train.visual_pretraining_losses(
+            encoder, batch, lambda_temporal=2, lambda_augmentation=3,
+            lambda_variance=5, lambda_covariance=7, variance_floor=4,
+        )
+        expected_variance = 4 - ((2 + 1e-4) ** 0.5 + (8 + 1e-4) ** 0.5) / 2
+        self.assertEqual(losses["temporal"].item(), 4)
+        self.assertEqual(losses["augmentation"].item(), 1)
+        self.assertAlmostEqual(losses["variance"].item(), expected_variance, places=6)
+        self.assertEqual(losses["covariance"].item(), 4 + 64)
+        self.assertAlmostEqual(losses["total"].item(), 2 * 4 + 3 + 5 * expected_variance + 7 * 68, places=4)
+        losses["total"].backward()
+        for z in (clean, z1, z2):
+            self.assertTrue(torch.isfinite(z.grad).all())
+            self.assertGreater(z.grad.abs().sum().item(), 0)
+
+    def test_disabled_temporal_skips_clean_pass_and_legacy_weights_reproduce_mse_sum(self):
+        z1 = torch.tensor([[[0., 0.], [2., 2.]]], requires_grad=True)
+        z2 = torch.zeros_like(z1, requires_grad=True)
+        batch = {"video": torch.zeros(1, 2, 3, 8, 8), "video_lengths": torch.tensor([2])}
+        encoder = Mock(side_effect=[z1, z2])
+        losses = train.visual_pretraining_losses(encoder, batch)
+        self.assertEqual(encoder.call_count, 2)
+        self.assertEqual(losses["temporal"].item(), 0)
+        encoder = Mock(side_effect=[z1, z1, z2])
+        with patch.object(train, "visual_variance_covariance_losses") as statistics:
+            losses = train.visual_pretraining_losses(
+                encoder, batch, lambda_temporal=1, lambda_augmentation=1,
+                lambda_variance=0, lambda_covariance=0,
+            )
+        statistics.assert_not_called()
+        self.assertEqual(losses["total"].item(), 4 + 2)
+        self.assertEqual(losses["variance"].item(), 0)
+        self.assertEqual(losses["covariance"].item(), 0)
 
     def test_views_change_each_call_retain_originals_and_preserve_padding(self):
         torch.manual_seed(12)
@@ -159,7 +261,9 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(parameter.grad).all())
 
     def test_pretraining_only_updates_video_and_resumes_epoch_count(self):
-        args = self.args()
+        args = self.args("--lambda-pretrain-temporal", "0.2", "--lambda-pretrain-augmentation", "3",
+                         "--lambda-pretrain-variance", "4", "--lambda-pretrain-covariance", "0.5",
+                         "--pretrain-variance-floor", "0.8")
         initial = {}
         construct = train.UnnobaModel
 
@@ -168,9 +272,21 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
             initial.update({name: value.clone() for name, value in model.state_dict().items()})
             return model
 
-        with patch.object(train, "UnnobaModel", side_effect=capture_model), contextlib.redirect_stdout(io.StringIO()):
+        log = io.StringIO()
+        with patch.object(train, "UnnobaModel", side_effect=capture_model), \
+                patch.object(train, "visual_pretraining_losses", wraps=train.visual_pretraining_losses) as losses, \
+                contextlib.redirect_stdout(log):
             train.train(args)
+        self.assertEqual(losses.call_args.kwargs, {
+            "lambda_temporal": 0.2, "lambda_augmentation": 3, "lambda_variance": 4,
+            "lambda_covariance": 0.5, "variance_floor": 0.8,
+        })
+        self.assertIn("variance=", log.getvalue())
+        self.assertIn("covariance=", log.getvalue())
         saved = torch.load(args.output, weights_only=False)
+        for key in ("lambda_pretrain_temporal", "lambda_pretrain_augmentation", "lambda_pretrain_variance",
+                    "lambda_pretrain_covariance", "pretrain_variance_floor"):
+            self.assertEqual(saved["training_args"][key], getattr(args, key))
         self.assertEqual(saved["training_stage"], "pretrain")
         self.assertEqual(saved["pretrain_epoch"], 1)
         self.assertEqual(saved["epoch"], 0)
@@ -233,6 +349,29 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
         (self.root / "pretrain.jsonl").write_text(json.dumps({"video": "held-out.avi"}) + "\n")
         with self.assertRaisesRegex(ValueError, "overlap"):
             train.train(self.args("--validation-manifest", str(valid)))
+
+    def test_loss_parameters_reject_nonfinite_negative_weights_and_nonpositive_floor(self):
+        for key in ("lambda_pretrain_temporal", "lambda_pretrain_augmentation", "lambda_pretrain_variance",
+                    "lambda_pretrain_covariance", "pretrain_variance_floor"):
+            invalid = [-1, float("nan"), float("inf"), float("-inf")]
+            if key == "pretrain_variance_floor":
+                invalid.append(0)
+            for value in invalid:
+                with self.subTest(key=key, value=value):
+                    args = self.args()
+                    setattr(args, key, value)
+                    with self.assertRaisesRegex(ValueError, "--" + key.replace("_", "-")):
+                        train.train(args)
+
+    def test_default_objective_and_zero_weight_ablation(self):
+        args = self.args()
+        self.assertEqual((args.lambda_pretrain_temporal, args.lambda_pretrain_augmentation,
+                          args.lambda_pretrain_variance, args.lambda_pretrain_covariance,
+                          args.pretrain_variance_floor), (0, 1, 1, 0.04, 1))
+        for key in ("lambda_pretrain_temporal", "lambda_pretrain_augmentation", "lambda_pretrain_variance",
+                    "lambda_pretrain_covariance"):
+            setattr(args, key, 0)
+        train.validate_pretraining_args(args)
 
 
 if __name__ == "__main__":
