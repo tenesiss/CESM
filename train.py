@@ -2026,14 +2026,15 @@ def visual_pretraining_losses(encoder: VideoEncoder, batch: dict,
                              lambda_augmentation: float = 1.0,
                              lambda_variance: float = 1.0,
                              lambda_covariance: float = 0.04,
-                             variance_floor: float = 1.0) -> Dict[str, torch.Tensor]:
+                             variance_floor: float = 1.0,
+                             original_probability: float = 0.2) -> Dict[str, torch.Tensor]:
     """Weighted losses on final encoder states; disabled terms report zero."""
     video, lengths = batch["video"], batch["video_lengths"]
     # Avoid the third encoder pass when temporal smoothing is disabled.
     temporal = (temporal_visual_loss(encoder(video, lengths), lengths, adjacent_frames)
                 if lambda_temporal else None)
-    z1 = encoder(augment_pretrain_video(video, lengths), lengths)
-    z2 = encoder(augment_pretrain_video(video, lengths), lengths)
+    z1 = encoder(augment_pretrain_video(video, lengths, original_probability), lengths)
+    z2 = encoder(augment_pretrain_video(video, lengths, original_probability), lengths)
     zero = z1[:, :0].float().sum() + z2[:, :0].float().sum()
     if temporal is None:
         temporal = zero
@@ -3166,6 +3167,7 @@ def pretrain_visual_encoder(model, loader, tokenizer, device, args, *, token_epo
                         lambda_variance=args.lambda_pretrain_variance,
                         lambda_covariance=args.lambda_pretrain_covariance,
                         variance_floor=args.pretrain_variance_floor,
+                        original_probability=args.pretrain_original_probability,
                     )
                 scaler.scale(losses["total"]).backward()
                 scaler.unscale_(opt)
@@ -3208,6 +3210,8 @@ def validate_pretraining_args(args) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and >= 0")
     if not math.isfinite(args.pretrain_variance_floor) or args.pretrain_variance_floor <= 0:
         raise ValueError("--pretrain-variance-floor must be finite and > 0")
+    if not math.isfinite(args.pretrain_original_probability) or not 0 <= args.pretrain_original_probability <= 1:
+        raise ValueError("--pretrain-original-probability must be finite and in [0,1]")
 
 
 def train(args) -> None:
@@ -3718,6 +3722,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Additional visual pretraining epochs when enabled (default: 5); uses --lr and --weight-decay")
     p.add_argument("--pretrain-adjacent-frames", type=int, default=2, metavar="N",
                    help="Compare each valid frame pair with 0 < j-i < N once (default: 2, consecutive pairs)")
+    p.add_argument("--pretrain-original-probability", type=float, default=0.2,
+                   help="Probability of keeping each frame unmodified, independently per augmented view (default: 0.2; range [0,1])")
     p.add_argument("--lambda-pretrain-temporal", type=float, default=0.0,
                    help="Pretraining temporal MSE weight (default: 0; disabled)")
     p.add_argument("--lambda-pretrain-augmentation", type=float, default=1.0,

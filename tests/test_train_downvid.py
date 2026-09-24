@@ -475,7 +475,8 @@ class PretrainingPreparationTests(PipelineFixture):
                             ("--lambda-pretrain-augmentation", "nan"),
                             ("--lambda-pretrain-variance", "inf"),
                             ("--lambda-pretrain-covariance", "-1"),
-                            ("--pretrain-variance-floor", "0")):
+                            ("--pretrain-variance-floor", "0"),
+                            ("--pretrain-original-probability", "1.1")):
             parser = pipeline.build_argparser()
             args = parser.parse_args(["--N-pretrain", "1", "--prepare-only", flag, value])
             with self.subTest(flag=flag), contextlib.redirect_stderr(io.StringIO()), \
@@ -570,7 +571,7 @@ class PretrainingPreparationTests(PipelineFixture):
                            "--pretrain-epochs", "3", "--pretrain-adjacent-frames", "4",
                            "--lambda-pretrain-temporal", "0.2", "--lambda-pretrain-augmentation", "3",
                            "--lambda-pretrain-variance", "4", "--lambda-pretrain-covariance", "0.5",
-                           "--pretrain-variance-floor", "0.8"])
+                           "--pretrain-variance-floor", "0.8", "--pretrain-original-probability", "0.65"])
         self.assertEqual(preparations, [(2, str(self.root / "data.jsonl"), False),
                                         (5, str(self.root / "pretrain.jsonl"), True)])
         forwarded = train.build_argparser().parse_args(commands[-1][2:])
@@ -580,6 +581,7 @@ class PretrainingPreparationTests(PipelineFixture):
         self.assertEqual((forwarded.lambda_pretrain_temporal, forwarded.lambda_pretrain_augmentation,
                           forwarded.lambda_pretrain_variance, forwarded.lambda_pretrain_covariance,
                           forwarded.pretrain_variance_floor), (0.2, 3, 4, 0.5, 0.8))
+        self.assertEqual(forwarded.pretrain_original_probability, 0.65)
         self.assertFalse(any(flag.startswith("--N-pretrain") for flag in commands[-1]))
 
 

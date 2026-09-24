@@ -163,6 +163,27 @@ class VisualPretrainingLossTests(unittest.TestCase):
         self.assertEqual(losses["variance"].item(), 0)
         self.assertEqual(losses["covariance"].item(), 0)
 
+    def test_original_probability_controls_both_pretraining_views(self):
+        torch.manual_seed(17)
+        video = torch.rand(2, 3, 3, 8, 8) * 2 - 1
+        video[1, 1:] = float("nan")
+        lengths = torch.tensor([3, 1])
+        valid = torch.arange(3)[None, :] < lengths[:, None]
+        for probability in (0, 1):
+            with self.subTest(probability=probability):
+                encoder = Mock(side_effect=lambda view, lengths: view.mean(dim=(2, 3, 4)).unsqueeze(-1))
+                train.visual_pretraining_losses(
+                    encoder, {"video": video, "video_lengths": lengths}, original_probability=probability,
+                )
+                self.assertEqual(encoder.call_count, 2)
+                for call in encoder.call_args_list:
+                    view = call.args[0]
+                    if probability == 1:
+                        torch.testing.assert_close(view[valid], video[valid], rtol=0, atol=0)
+                    else:
+                        self.assertFalse((view[valid] == video[valid]).flatten(1).all(1).any())
+                    self.assertEqual(view[~valid].abs().sum().item(), 0)
+
     def test_views_change_each_call_retain_originals_and_preserve_padding(self):
         torch.manual_seed(12)
         video = torch.rand(2, 50, 3, 8, 8) * 2 - 1
@@ -263,7 +284,7 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
     def test_pretraining_only_updates_video_and_resumes_epoch_count(self):
         args = self.args("--lambda-pretrain-temporal", "0.2", "--lambda-pretrain-augmentation", "3",
                          "--lambda-pretrain-variance", "4", "--lambda-pretrain-covariance", "0.5",
-                         "--pretrain-variance-floor", "0.8")
+                         "--pretrain-variance-floor", "0.8", "--pretrain-original-probability", "0.65")
         initial = {}
         construct = train.UnnobaModel
 
@@ -279,13 +300,13 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
             train.train(args)
         self.assertEqual(losses.call_args.kwargs, {
             "lambda_temporal": 0.2, "lambda_augmentation": 3, "lambda_variance": 4,
-            "lambda_covariance": 0.5, "variance_floor": 0.8,
+            "lambda_covariance": 0.5, "variance_floor": 0.8, "original_probability": 0.65,
         })
         self.assertIn("variance=", log.getvalue())
         self.assertIn("covariance=", log.getvalue())
         saved = torch.load(args.output, weights_only=False)
         for key in ("lambda_pretrain_temporal", "lambda_pretrain_augmentation", "lambda_pretrain_variance",
-                    "lambda_pretrain_covariance", "pretrain_variance_floor"):
+                    "lambda_pretrain_covariance", "pretrain_variance_floor", "pretrain_original_probability"):
             self.assertEqual(saved["training_args"][key], getattr(args, key))
         self.assertEqual(saved["training_stage"], "pretrain")
         self.assertEqual(saved["pretrain_epoch"], 1)
@@ -352,10 +373,12 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
 
     def test_loss_parameters_reject_nonfinite_negative_weights_and_nonpositive_floor(self):
         for key in ("lambda_pretrain_temporal", "lambda_pretrain_augmentation", "lambda_pretrain_variance",
-                    "lambda_pretrain_covariance", "pretrain_variance_floor"):
+                    "lambda_pretrain_covariance", "pretrain_variance_floor", "pretrain_original_probability"):
             invalid = [-1, float("nan"), float("inf"), float("-inf")]
             if key == "pretrain_variance_floor":
                 invalid.append(0)
+            if key == "pretrain_original_probability":
+                invalid.append(1.1)
             for value in invalid:
                 with self.subTest(key=key, value=value):
                     args = self.args()
@@ -365,6 +388,7 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
 
     def test_default_objective_and_zero_weight_ablation(self):
         args = self.args()
+        self.assertEqual(args.pretrain_original_probability, 0.2)
         self.assertEqual((args.lambda_pretrain_temporal, args.lambda_pretrain_augmentation,
                           args.lambda_pretrain_variance, args.lambda_pretrain_covariance,
                           args.pretrain_variance_floor), (0, 1, 1, 0.04, 1))
@@ -372,6 +396,9 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
                     "lambda_pretrain_covariance"):
             setattr(args, key, 0)
         train.validate_pretraining_args(args)
+        for probability in (0, 1):
+            args.pretrain_original_probability = probability
+            train.validate_pretraining_args(args)
 
 
 if __name__ == "__main__":

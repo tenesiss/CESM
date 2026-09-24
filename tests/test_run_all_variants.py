@@ -204,6 +204,8 @@ class AllVariantRunnerTests(unittest.TestCase):
             ["-N", "1", "--lambda-pretrain-variance", "inf"],
             ["-N", "1", "--lambda-pretrain-covariance", "-1"],
             ["-N", "1", "--pretrain-variance-floor", "0"],
+            ["-N", "1", "--pretrain-original-probability", "-0.1"],
+            ["-N", "1", "--variant-args", "1:--pretrain-original-probability nan"],
             ["-N", "1", "--variant-args", "1:--pretrain-variance-floor nan"],
             ["-N", "1", "--variant-args", "1:--pretrain-manifest other.jsonl"],
         ):
@@ -219,8 +221,8 @@ class AllVariantRunnerTests(unittest.TestCase):
                     "--pretrained-lm", "model", "--download-max-frames", "20",
                     "--lambda-pretrain-temporal", "0.2", "--lambda-pretrain-augmentation", "3",
                     "--lambda-pretrain-variance", "4", "--lambda-pretrain-covariance", "0.5",
-                    "--pretrain-variance-floor", "0.8",
-                    "--variant-args", "5:--lambda-pretrain-covariance 0.7 --pretrain-variance-floor 0.9",
+                    "--pretrain-variance-floor", "0.8", "--pretrain-original-probability", "0.65",
+                    "--variant-args", "5:--lambda-pretrain-covariance 0.7 --pretrain-variance-floor 0.9 --pretrain-original-probability 1",
                 ])
                 self.assertEqual([s["name"] for s in stages[:3]],
                                  ["download", "download_validation", "download_pretrain"])
@@ -242,6 +244,7 @@ class AllVariantRunnerTests(unittest.TestCase):
                                           parsed.lambda_pretrain_variance), (0.2, 3, 4))
                         expected = (0.7, 0.9) if stage["name"] == "train_5" else (0.5, 0.8)
                         self.assertEqual((parsed.lambda_pretrain_covariance, parsed.pretrain_variance_floor), expected)
+                        self.assertEqual(parsed.pretrain_original_probability, 1 if stage["name"] == "train_5" else 0.65)
 
     def test_reused_pretraining_manifest_is_snapshotted_and_excluded_from_validation(self):
         for name in ("train", "pretrain", "valid"):

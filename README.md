@@ -196,6 +196,7 @@ python3 train.py \
   --pretrain-manifest data/unlabeled.jsonl \
   --pretrain-epochs 5 \
   --pretrain-adjacent-frames 2 \
+  --pretrain-original-probability 0.2 \
   --lambda-pretrain-temporal 0 \
   --lambda-pretrain-augmentation 1 \
   --lambda-pretrain-variance 1 \
@@ -227,6 +228,7 @@ total = lambda_pretrain_temporal * temporal
 | `--lambda-pretrain-variance` | `1` | Weight of the per-feature standard-deviation floor penalty. |
 | `--lambda-pretrain-covariance` | `0.04` | Weight of the off-diagonal covariance penalty. |
 | `--pretrain-variance-floor` | `1` | Target minimum **standard deviation**, despite the parameter's name. |
+| `--pretrain-original-probability` | `0.2` | Probability of retaining each original frame, independently per augmented view; finite and in `[0,1]`. |
 
 Weights must be finite and nonnegative; zero disables a term. The floor must be
 finite and positive. These settings work in `train.py`, the download wrappers,
@@ -240,9 +242,11 @@ The component losses are:
   excluded, and clips with one frame contribute no temporal pairs.
 - Augmentation MSE: independently generate two views per frame and average
   their representation MSE over valid frames. Each view samples brightness and
-  contrast factors from `[0.8,1.2]` and rotation from `[-5,5]` degrees, with a 20%
-  chance per frame of keeping the exact original image. Views are resampled
-  every step; padded frames contribute no loss.
+  contrast factors from `[0.8,1.2]` and rotation from `[-5,5]` degrees.
+  `--pretrain-original-probability` controls the chance per frame of keeping the
+  exact original image (default `0.2`), independently for each view. Set `0` to
+  always apply augmentation or `1` to retain every original frame. Views are
+  resampled every step; padded frames contribute no loss.
 - Variance: for each view separately, pool valid frames across clips into an
   `[N,D]` matrix and compute sample variance per feature. Penalize
   `mean(relu(floor - sqrt(sample_variance + eps)))`, then average the two
@@ -281,8 +285,9 @@ to initialize the supervised tokenizer for the checkpoint. Resume with
 `--resume checkpoints/cesm.pt`; omitting both pretraining flags starts supervised
 training directly, while including them runs additional pretraining epochs.
 The checkpoint preserves the cumulative `pretrain_epoch` count. Changing the
-video encoder clears any previously trained confidence status. All four weights
-and the variance floor are recorded in `training_args`; pass custom settings
+video encoder clears any previously trained confidence status. All four weights,
+the variance floor, and the original-image probability are recorded in
+`training_args`; pass custom settings
 again when resuming, since pretraining uses the current command's values.
 
 For download workflows, `--N-pretrain` sets the number of pretraining videos
