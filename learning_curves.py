@@ -102,8 +102,11 @@ class LearningCurveLogger:
                     points = [(row["epoch"], row[curve]) for row in records if row[curve] is not None]
                     if points:
                         x, y = zip(*points)
+                        if kind == "accuracy":
+                            # Convert stored fractions to percentages before plotting.
+                            y = [value * 100 for value in y]
                         training = curve.startswith("training_")
-                        axis.plot(x, [v * 100 if kind == "accuracy" else v for v in y],
+                        axis.plot(x, y,
                                   label=curve.replace("_", " ").capitalize(), color=color,
                                   linestyle="-" if training else "--", marker="o" if training else "x")
                 axis.set(title=f"{stage.capitalize()} stage", xlabel="Epoch",
