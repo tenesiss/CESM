@@ -348,6 +348,126 @@ class VisualPretrainingTrainingTests(unittest.TestCase):
         self.assertEqual(saved["pretrain_epoch"], 1)
         self.assertEqual(saved["epoch"], 2)
 
+    def test_pretrain_only_overrides_supervised_epochs_and_skips_supervised_data_and_metrics(self):
+        args = self.args("--pretrain-only", "--epochs", "3", "--confidence-epochs", "2",
+                         "--metrics-csv", "auto", "--plot-learning-curves")
+        args.pretrain_visual_encoder = False  # The new flag enables pretraining itself.
+        with patch.object(train, "VideoTextWindowDataset", side_effect=AssertionError("supervised data loaded")), \
+                patch.object(train, "evaluate_samples", side_effect=AssertionError("supervised metrics ran")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            train.train(args)
+        saved = torch.load(args.output, weights_only=False)
+        self.assertEqual((saved["training_stage"], saved["epoch"], saved["confidence_epoch"]), ("pretrain", 0, 0))
+        self.assertEqual(saved["pretrain_epoch"], 1)
+        self.assertFalse(saved["tokenizer_pending"])
+        self.assertFalse(Path(args.output).with_suffix(".metrics.csv").exists())
+        self.assertFalse(Path(args.output).with_suffix(".learning.csv").exists())
+
+    def test_unlabeled_pretrain_only_resumes_full_training_and_preserves_visual_weights(self):
+        for fusion in ("residual", "frame"):
+            with self.subTest(fusion=fusion):
+                args = self.args("--pretrain-only", "--text-fusion", fusion)
+                args.manifest = None
+                with contextlib.redirect_stdout(io.StringIO()):
+                    train.train(args)
+                saved = torch.load(args.output, weights_only=False)
+                self.assertTrue(saved["tokenizer_pending"])
+                self.assertEqual(saved["tokenizer"]["itos"], train.CharTokenizer.build([]).itos)
+                # Additional explicit pretraining preserves the pending vocabulary.
+                args.resume = args.output
+                with contextlib.redirect_stdout(io.StringIO()):
+                    train.train(args)
+                saved = torch.load(args.output, weights_only=False)
+                self.assertEqual(saved["pretrain_epoch"], 2)
+                self.assertTrue(saved["tokenizer_pending"])
+
+                resumed = self.args("--resume", args.output, "--epochs", "1", "--confidence-epochs", "1")
+                resumed.pretrain_visual_encoder = False
+                resumed.pretrain_manifest = None
+                resumed.epochs = 0
+                with self.assertRaisesRegex(ValueError, "requires --epochs > 0"):
+                    train.train(resumed)
+                resumed.epochs = 1
+                stages = []
+                configure = train.configure_token_stage
+                save = train.save_checkpoint
+
+                def check_visual_weights(model):
+                    for name, value in model.video_encoder.state_dict().items():
+                        torch.testing.assert_close(value, saved["model_state"]["video_encoder." + name], rtol=0, atol=0)
+                    return configure(model)
+
+                def record(*positional, **kwargs):
+                    stages.append(kwargs.get("stage", "token"))
+                    return save(*positional, **kwargs)
+
+                with patch.object(train, "pretrain_visual_encoder", side_effect=AssertionError("pretraining repeated")), \
+                        patch.object(train, "configure_token_stage", side_effect=check_visual_weights), \
+                        patch.object(train, "save_checkpoint", side_effect=record), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    train.train(resumed)
+                self.assertEqual(stages, ["token", "confidence"])
+                trained = torch.load(args.output, weights_only=False)
+                self.assertFalse(trained["tokenizer_pending"])
+                self.assertEqual(trained["tokenizer"]["itos"], train.CharTokenizer.build(["ab"]).itos)
+                self.assertEqual((trained["pretrain_epoch"], trained["epoch"], trained["confidence_epoch"]), (2, 1, 1))
+                self.assertTrue(trained["confidence"]["trained"])
+                # Once supervised training fixes the vocabulary, mismatches still fail.
+                mismatch = self.root / "mismatch.jsonl"
+                mismatch.write_text(json.dumps({"video": "clip.avi", "text": "cd", "windows": [[0, 1], [2, 4]]}) + "\n")
+                resumed.manifest = str(mismatch)
+                with self.assertRaisesRegex(ValueError, "character vocabulary"):
+                    train.train(resumed)
+
+    def test_pretrain_only_requires_source_and_rejects_confidence_only(self):
+        cases = [
+            ({"pretrain_only": True, "pretrain_manifest": None}, "requires --pretrain-manifest"),
+            ({"pretrain_only": True, "confidence_only": True}, "cannot be combined"),
+            ({"manifest": None}, "--manifest is required"),
+        ]
+        for overrides, message in cases:
+            args = self.args()
+            for name, value in overrides.items():
+                setattr(args, name, value)
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, message):
+                train.train(args)
+
+    def test_unlabeled_pretrain_only_keeps_pretrained_lm_and_resumes_offline(self):
+        from tokenizers import Tokenizer, models
+        from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
+
+        lm_path = self.root / "tiny-lm"
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(models.WordLevel(
+                {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3, "ab": 4}, unk_token="<unk>")),
+            pad_token="<pad>", bos_token="<bos>", eos_token="<eos>", unk_token="<unk>",
+        )
+        tokenizer.save_pretrained(lm_path)
+        lm = GPT2LMHeadModel(GPT2Config(
+            vocab_size=len(tokenizer), n_embd=8, n_head=2, n_layer=1, n_positions=32,
+            bos_token_id=1, eos_token_id=2, resid_pdrop=0, embd_pdrop=0, attn_pdrop=0,
+        ))
+        lm.save_pretrained(lm_path)
+        args = self.args("--pretrain-only", "--pretrained-lm", str(lm_path), "--pretrained-lm-local-files-only")
+        args.manifest = None
+        with contextlib.redirect_stdout(io.StringIO()):
+            train.train(args)
+        saved = torch.load(args.output, weights_only=False)
+        self.assertFalse(saved["tokenizer_pending"])
+        lm_path.rename(self.root / "hidden-lm")  # Resume must rebuild from the checkpoint.
+        resumed = self.args("--resume", args.output, "--epochs", "1", "--confidence-epochs", "1")
+        resumed.pretrain_visual_encoder = False
+        resumed.pretrain_manifest = None
+        with contextlib.redirect_stdout(io.StringIO()):
+            train.train(resumed)
+        trained = torch.load(args.output, weights_only=False)
+        self.assertEqual(trained["tokenizer"], saved["tokenizer"])
+        self.assertEqual((trained["pretrain_epoch"], trained["epoch"], trained["confidence_epoch"]), (1, 1, 1))
+        self.assertTrue(trained["confidence"]["trained"])
+        for name, value in saved["model_state"].items():
+            if name.startswith("text_encoder."):
+                torch.testing.assert_close(trained["model_state"][name], value, atol=0, rtol=0)
+
     def test_invalid_options_and_validation_overlap_fail_early(self):
         cases = [
             ({"pretrain_manifest": None}, "requires --pretrain-manifest"),

@@ -2924,6 +2924,7 @@ def save_checkpoint(
         "model_config": asdict(model.cfg),
         "training_args": vars(args).copy(),
         "tokenizer": tokenizer.state_dict(),
+        "tokenizer_pending": getattr(args, "tokenizer_pending", False),
         "preprocess": {
             "mouth_size": model.cfg.mouth_size,
             "use_face_detector": not args.no_face_detector,
@@ -3199,6 +3200,8 @@ def pretrain_visual_encoder(model, loader, tokenizer, device, args, *, token_epo
 
 def validate_pretraining_args(args) -> None:
     """Shared validation for the trainer, downloader, and variant runner."""
+    if args.pretrain_only and args.confidence_only:
+        raise ValueError("--pretrain-only cannot be combined with --confidence-only")
     if args.pretrain_epochs <= 0:
         raise ValueError("--pretrain-epochs must be > 0")
     if args.pretrain_adjacent_frames < 2:
@@ -3218,6 +3221,10 @@ def train(args) -> None:
     validate_early_stopping_args(args)
     validate_pretraining_args(args)
     accuracy_decode_args(args)
+    if args.pretrain_only:
+        args.pretrain_visual_encoder = True
+    if not args.manifest and not args.pretrain_only:
+        raise ValueError("--manifest is required unless --pretrain-only is used")
     if args.pretrain_manifest and not args.pretrain_visual_encoder:
         raise ValueError("--pretrain-manifest requires --pretrain-visual-encoder")
     if args.pretrain_visual_encoder and not args.pretrain_manifest:
@@ -3227,7 +3234,8 @@ def train(args) -> None:
     metrics_path = None
     if args.metrics_csv:
         metrics_path = str(Path(args.output).with_suffix(".metrics.csv")) if args.metrics_csv == "auto" else args.metrics_csv
-        if Path(metrics_path).resolve() in (Path(args.output).resolve(), Path(args.manifest).resolve()):
+        if Path(metrics_path).resolve() in {Path(path).resolve() for path in
+                                           (args.output, args.manifest) if path}:
             raise ValueError("--metrics-csv must differ from the checkpoint and manifest paths")
     if args.pretrain_manifest:
         protected = {Path(args.output).resolve()}
@@ -3249,6 +3257,8 @@ def train(args) -> None:
         raise ValueError("--max-frames must be > 0")
     if args.epochs < 0 or args.confidence_epochs < 0:
         raise ValueError("--epochs and --confidence-epochs must be >= 0")
+    if args.pretrain_only:
+        args.epochs = args.confidence_epochs = 0
     if args.confidence_only:
         if not args.resume:
             raise ValueError("--confidence-only requires --resume")
@@ -3267,7 +3277,11 @@ def train(args) -> None:
     if args.confidence_token_temperature <= 0 or args.confidence_temperature <= 0:
         raise ValueError("confidence temperatures must be > 0")
 
-    curves = LearningCurveLogger(args)
+    # Pretraining has no supervised metrics or learning curves.
+    curve_args = argparse.Namespace(**vars(args))
+    if pretrain_only:
+        curve_args.plot_learning_curves = False
+    curves = LearningCurveLogger(curve_args)
     if curves.selected:
         protected = {Path(path).resolve() for path in
                      (args.output, args.manifest, args.pretrain_manifest,
@@ -3278,7 +3292,7 @@ def train(args) -> None:
               "streaming accuracy evaluates complete videos after each epoch")
 
     seed_everything(args.seed)
-    rows = load_manifest(args.manifest)
+    rows = load_manifest(args.manifest) if args.manifest else []
     pretrain_rows = load_manifest(args.pretrain_manifest, video_only=True) if args.pretrain_visual_encoder else None
     validation_rows = load_manifest(args.validation_manifest) if args.validation_manifest else None
     if validation_rows is not None:
@@ -3290,6 +3304,8 @@ def train(args) -> None:
         if metrics_path and Path(metrics_path).resolve() == Path(args.validation_manifest).resolve():
             raise ValueError("--metrics-csv must differ from --validation-manifest")
     resume_ckpt = None
+    initialize_vocabulary = False
+    args.tokenizer_pending = False
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         cfg = ModelConfig(**resume_ckpt["model_config"])
@@ -3307,9 +3323,20 @@ def train(args) -> None:
             )
         tokenizer = tokenizer_from_state_dict(resume_ckpt["tokenizer"])
         if cfg.text_encoder_type == "learned":
-            manifest_tokenizer = CharTokenizer.build(row["text"] for row in rows)
-            if tokenizer.state_dict().get("itos") != manifest_tokenizer.state_dict().get("itos"):
-                raise ValueError("--resume tokenizer does not match the manifest's character vocabulary")
+            args.tokenizer_pending = bool(resume_ckpt.get("tokenizer_pending", False))
+            if args.tokenizer_pending and not pretrain_only and args.epochs == 0:
+                raise ValueError("Resuming pretraining without a character vocabulary requires --epochs > 0")
+            if rows:
+                manifest_tokenizer = CharTokenizer.build(row["text"] for row in rows)
+                if args.tokenizer_pending:
+                    # No transcripts were available during pretraining. Only
+                    # vocabulary-dependent weights need fresh initialization.
+                    tokenizer = manifest_tokenizer
+                    cfg.vocab_size = tokenizer.vocab_size
+                    initialize_vocabulary = True
+                    args.tokenizer_pending = False
+                elif tokenizer.state_dict().get("itos") != manifest_tokenizer.state_dict().get("itos"):
+                    raise ValueError("--resume tokenizer does not match the manifest's character vocabulary")
             if args.pretrained_lm:
                 raise ValueError("--pretrained-lm cannot be used when resuming a learned-text checkpoint")
             if args.fine_tune_pretrained_lm:
@@ -3341,6 +3368,7 @@ def train(args) -> None:
             if args.fine_tune_pretrained_lm:
                 raise ValueError("--fine-tune-pretrained-lm requires --pretrained-lm")
             tokenizer = CharTokenizer.build(row["text"] for row in rows)
+            args.tokenizer_pending = not rows
 
         cfg = ModelConfig(
             vocab_size=tokenizer.vocab_size,
@@ -3377,20 +3405,22 @@ def train(args) -> None:
     else:
         device = torch.device(args.device)
     amp_enabled = args.amp and device.type == "cuda"
-    ds = VideoTextWindowDataset(
-        rows, tokenizer, cfg.mouth_size, use_face_detector=not args.no_face_detector,
-        max_frames=args.max_frames,
-        video_dtype=torch.get_autocast_dtype(device.type) if amp_enabled else torch.float32,
-        window_phasing=args.window_phasing,
-    )
-    loader = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.workers,
-        collate_fn=make_collate(tokenizer.pad_id),
-        pin_memory=torch.cuda.is_available(),
-    )
+    video_dtype = torch.get_autocast_dtype(device.type) if amp_enabled else torch.float32
+    ds = None
+    if not pretrain_only:
+        ds = VideoTextWindowDataset(
+            rows, tokenizer, cfg.mouth_size, use_face_detector=not args.no_face_detector,
+            max_frames=args.max_frames, video_dtype=video_dtype,
+            window_phasing=args.window_phasing,
+        )
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.workers,
+            collate_fn=make_collate(tokenizer.pad_id),
+            pin_memory=torch.cuda.is_available(),
+        )
     validation_selection = {}
     token_monitor = confidence_monitor = None
     validation_ds = None
@@ -3399,9 +3429,9 @@ def train(args) -> None:
                           num_workers=args.workers, collate_fn=make_collate(tokenizer.pad_id),
                           pin_memory=device.type == "cuda",
                           generator=torch.Generator().manual_seed(args.seed))
-    if validation_rows is not None or curves.selected:
+    if not pretrain_only and (validation_rows is not None or curves.selected):
         training_loss_loader = loss_loader(ds)
-    if validation_rows is not None:
+    if validation_rows is not None and not pretrain_only:
         validation_ds = VideoTextWindowDataset(
             validation_rows, tokenizer, cfg.mouth_size, use_face_detector=not args.no_face_detector,
             max_frames=args.max_frames, video_dtype=ds.video_dtype,
@@ -3441,6 +3471,12 @@ def train(args) -> None:
     prior_confidence_epoch = 0
     confidence_already_trained = False
     if resume_ckpt is not None:
+        if initialize_vocabulary:
+            fresh_state = model.state_dict()
+            for name in ("text_encoder.embed.weight", "mixed.token_head.weight", "mixed.token_head.bias"):
+                resume_ckpt["model_state"][name] = fresh_state[name]
+            del fresh_state
+            print("Initialized character vocabulary from the supervised manifest")
         model.load_state_dict(resume_ckpt["model_state"], strict=True)
         start_epoch = int(resume_ckpt.get("epoch", 0) or 0)
         args.pretrain_epoch = int(resume_ckpt.get("pretrain_epoch", 0) or 0)
@@ -3473,7 +3509,7 @@ def train(args) -> None:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
-        f"device={device} examples={len(ds)} vocab={tokenizer.vocab_size} "
+        f"device={device} examples={len(ds) if ds is not None else 0} vocab={tokenizer.vocab_size} "
         f"text_encoder={cfg.text_encoder_type} params={total_params:,} trainable={trainable_params:,}"
     )
     print("window semantics: full text prefix; section-local token targets; EOS only at the true video end")
@@ -3492,7 +3528,7 @@ def train(args) -> None:
     if pretrain_rows is not None:
         pretrain_ds = PretrainVideoDataset(
             pretrain_rows, cfg.mouth_size, use_face_detector=not args.no_face_detector,
-            max_frames=args.max_frames, video_dtype=ds.video_dtype,
+            max_frames=args.max_frames, video_dtype=video_dtype,
         )
         pretrain_loader = DataLoader(
             pretrain_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
@@ -3502,6 +3538,9 @@ def train(args) -> None:
               f"adjacent_frames={args.pretrain_adjacent_frames}")
         pretrain_visual_encoder(model, pretrain_loader, tokenizer, device, args, token_epoch=start_epoch)
         del pretrain_loader, pretrain_ds
+    if pretrain_only:
+        print("Pretraining complete. Resume this checkpoint without pretraining flags to train token and confidence stages.")
+        return
 
     # ------------------------------------------------------------------
     # Stage 1: token/frame prediction; confidence-only layers are not used.
@@ -3710,12 +3749,15 @@ def train(args) -> None:
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train the causal Unnoba video-to-text prototype")
     p.add_argument(
-        "--manifest", required=True,
-        help="JSONL with video, text and per-character (or pretrained-token) frame windows",
+        "--manifest", default=None,
+        help="JSONL with video, text and per-character (or pretrained-token) frame windows; required unless --pretrain-only",
     )
     p.add_argument("--output", default="unnoba.pt")
     p.add_argument("--pretrain-visual-encoder", action="store_true",
                    help="Pretrain the full video encoder with VICReg-style losses and optional temporal MSE")
+    p.add_argument("--pretrain-only", action="store_true",
+                   help="Run only visual pretraining and save a resumable checkpoint; enables --pretrain-visual-encoder, "
+                        "overrides --epochs/--confidence-epochs to 0, and skips supervised metrics")
     p.add_argument("--pretrain-manifest", default=None,
                    help="Pretraining JSONL with video paths; text/windows are optional and ignored")
     p.add_argument("--pretrain-epochs", type=int, default=5,
@@ -3747,7 +3789,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--variant-name", default=None, help="Experiment label in the metrics CSV")
     add_learning_curve_arguments(p)
     p.add_argument("--resume", default=None,
-                   help="Optional compatible checkpoint. Add --confidence-only to skip token training.")
+                   help="Optional compatible checkpoint; pretraining-only checkpoints proceed to full training unless "
+                        "pretraining flags are supplied again. Add --confidence-only to skip token training.")
     p.add_argument(
         "--confidence-only", action="store_true",
         help="Train only the frozen-token confidence stage; requires --resume and overrides --epochs to 0",

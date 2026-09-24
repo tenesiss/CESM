@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Download TalkVid or HDTF videos, align them with the local frame grouper, then train.
+"""Download TalkVid, HDTF, or Shofo videos, align them with the local frame grouper, then train.
 
 All training options come directly from train.build_argparser(). See --help
 and README.md for download/preprocessing options. N counts usable clips, not
-unique source YouTube uploads. HDTF uses hosted videos without YouTube access.
+unique source uploads. HDTF and Shofo use hosted videos without YouTube access.
 --N-pretrain independently counts unannotated videos for visual pretraining.
 """
 
@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from hdtf_download import DEFAULT_HDTF_ARCHIVE, ArchiveAccessError, copy_video, open_archive
+from shofo_download import SHOFO_REPO, ShofoAccessError, ShofoClip, copy_shofo_video, iter_shofo
 
 
 ROOT = Path(__file__).resolve().parent
@@ -63,11 +64,11 @@ def build_argparser():
         elif action.dest == "pretrain_manifest":
             action.help = "Pretraining JSONL to reuse, or output path with --N-pretrain (default: WORK_DIR/pretrain.jsonl)"
     group = parser.add_argument_group("Dataset download and preprocessing")
-    group.add_argument("--dataset", choices=["talkvid", "hdtf"], default="talkvid",
-                       help="Video source (default: talkvid); hdtf downloads hosted MP4s without YouTube")
+    group.add_argument("--dataset", choices=["talkvid", "hdtf", "shofo"], default="talkvid",
+                       help="Video source (default: talkvid); hdtf and shofo download hosted MP4s")
     group.add_argument("--num-videos", "-N", type=positive_int,
                        help="Number of successfully aligned videos/clips to train on; required "
-                            "except with --login, --logout, or --N-pretrain with --prepare-only")
+                            "except with --login, --logout, --pretrain-only, or --N-pretrain with --prepare-only")
     group.add_argument("--N-pretrain", dest="num_pretrain", type=positive_int,
                        help="Download exactly this many videos for self-supervised pretraining, without alignment; "
                             "enables --pretrain-visual-encoder (default manifest: WORK_DIR/pretrain.jsonl)")
@@ -75,12 +76,15 @@ def build_argparser():
                        help="Download/alignment cache (default: data/DATASET beside this script)")
     group.add_argument("--hdtf-archive", default=DEFAULT_HDTF_ARCHIVE,
                        help="HDTF ZIP URL or local ZIP path; remote servers must support HTTP byte ranges")
+    group.add_argument("--shofo-revision", default="main",
+                       help="Shofo Hugging Face branch, tag, or commit (default: main); "
+                            "authenticate with hf auth login or HF_TOKEN")
     group.add_argument("--metadata", default=DEFAULT_METADATA,
                        help="TalkVid JSON array or JSONL: local path or HTTP(S) URL")
     group.add_argument("--dataset-language", action="append", default=[], metavar="NAME",
                        help="Filter info.Language, e.g. English or Spanish; repeatable")
     group.add_argument("--start-index", type=int, default=0,
-                       help="Skip N metadata rows or HDTF videos in filename order (default: 0)")
+                       help="Skip N metadata rows or HDTF/Shofo videos in filename order (default: 0)")
     group.add_argument("--exclude-manifest", type=Path,
                        help="Exclude local videos and known source uploads from this JSONL (for validation downloads)")
     group.add_argument("--max-attempts", type=positive_int,
@@ -351,6 +355,18 @@ def iter_hdtf(args):
 
 
 def download_hdtf_clip(clip, args, archive, member):
+    return download_hosted_clip(clip, args, "hdtf", clip.member,
+                                lambda output: copy_video(archive, member, output, args.download_timeout))
+
+
+def download_shofo_clip(clip, args):
+    return download_hosted_clip(clip, args, "shofo", clip.filename,
+                                lambda output: copy_shofo_video(
+                                    clip, output, args.download_timeout, args.download_retries))
+
+
+def download_hosted_clip(clip, args, dataset, description, copy_source):
+    """Stage, validate, and optionally trim one complete hosted MP4."""
     cached = cached_download(clip, args)
     if cached is not None:
         print(f"  Reusing download: {cached}", flush=True)
@@ -362,10 +378,10 @@ def download_hdtf_clip(clip, args, archive, member):
     with tempfile.TemporaryDirectory(prefix="download-", dir=folder) as staging:
         source = Path(staging) / "source.mp4"
         with log.open("w", encoding="utf-8") as stream:
-            stream.write(f"HDTF member: {clip.member}\n")
+            stream.write(f"{dataset} video: {description}\n")
             stream.flush()
             try:
-                copy_video(archive, member, source, args.download_timeout)
+                copy_source(source)
                 duration = probe_video(source, None)
                 output = source
                 if args.download_max_frames is not None:
@@ -385,7 +401,7 @@ def download_hdtf_clip(clip, args, archive, member):
                     subprocess.SubprocessError) as exc:
                 stream.write(f"Failed: {exc}\n")
                 raise
-    write_json(folder / "download.json", {"dataset": "hdtf", "clip": clip.__dict__,
+    write_json(folder / "download.json", {"dataset": dataset, "clip": clip.__dict__,
                "max_frames": args.download_max_frames, "video_signature": video_signature(video)})
     return video
 
@@ -561,6 +577,8 @@ def download_folder(clip, args):
     }
     if isinstance(clip, ArchiveClip):
         settings = {"dataset": "hdtf", "version": 1, "max_frames": args.download_max_frames}
+    elif isinstance(clip, ShofoClip):
+        settings = {"dataset": "shofo", "version": 1, "max_frames": args.download_max_frames}
     return args.work_dir / "clips" / clip.key / digest(settings)[:12]
 
 
@@ -699,7 +717,8 @@ def alignment_tokenizer(args):
         if isinstance(tokenizer, train.CharTokenizer):
             if args.fine_tune_pretrained_lm:
                 raise ValueError("--fine-tune-pretrained-lm requires a pretrained-LM checkpoint")
-            resume_chars = state["itos"]
+            if not checkpoint.get("tokenizer_pending", False):
+                resume_chars = state["itos"]
     elif args.pretrained_lm:
         tokenizer = train.HuggingFaceTokenizer.from_pretrained(
             args.pretrained_lm, local_files_only=args.pretrained_lm_local_files_only,
@@ -768,6 +787,8 @@ def prepare(args, *, video_only=False):
             config["download_max_frames"] = args.download_max_frames
         config_key = digest(config)[:24]
     source = args.hdtf_archive if args.dataset == "hdtf" else args.metadata
+    if args.dataset == "shofo":
+        source = f"{SHOFO_REPO}@{args.shofo_revision}"
     report = {"dataset": args.dataset, "metadata": source, "requested": args.num_videos,
               "download_max_frames": args.download_max_frames,
               "manifest": str(args.manifest), "results": [], "failures": [],
@@ -782,13 +803,14 @@ def prepare(args, *, video_only=False):
     attempts = 0
     whisper = None
     languages = {value.casefold() for value in args.dataset_language}
-    if args.dataset == "hdtf" and "en" in languages:
+    if args.dataset in ("hdtf", "shofo") and "en" in languages:
         languages.add("english")
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
     partial = args.manifest.with_name(args.manifest.name + ".partial")
     print(f"Reading {args.dataset} source: {source}", flush=True)
     try:
-        candidates = iter_hdtf(args) if args.dataset == "hdtf" else iter_metadata(args.metadata)
+        candidates = (iter_hdtf(args) if args.dataset == "hdtf" else
+                      iter_shofo(args) if args.dataset == "shofo" else iter_metadata(args.metadata))
         with partial.open("w", encoding="utf-8") as jsonl, contextlib.closing(candidates) as rows:
             for index, row in enumerate(rows):
                 if index < args.start_index:
@@ -800,7 +822,7 @@ def prepare(args, *, video_only=False):
                                   str(info.get("Language", "")).casefold() not in languages):
                     continue
                 try:
-                    clip = row["clip"] if args.dataset == "hdtf" else Clip.from_row(row)
+                    clip = Clip.from_row(row) if args.dataset == "talkvid" else row["clip"]
                 except (TypeError, ValueError, AttributeError) as exc:
                     report["failures"].append({"index": index, "error": f"Invalid metadata: {exc}"})
                     continue
@@ -818,12 +840,17 @@ def prepare(args, *, video_only=False):
                     continue
                 attempts += 1
                 description = (clip.member if isinstance(clip, ArchiveClip) else
+                               clip.filename if isinstance(clip, ShofoClip) else
                                f"{clip.url} [{clip.start:.3f}, {clip.end:.3f}]")
                 print(f"[{len(records)}/{args.num_videos} usable; attempt {attempts}/{args.max_attempts}] "
                       + description, flush=True)
                 try:
-                    video = (download_hdtf_clip(clip, args, row["archive"], row["member"])
-                             if args.dataset == "hdtf" else download_clip(clip, args))
+                    if args.dataset == "hdtf":
+                        video = download_hdtf_clip(clip, args, row["archive"], row["member"])
+                    elif args.dataset == "shofo":
+                        video = download_shofo_clip(clip, args)
+                    else:
+                        video = download_clip(clip, args)
                     if video_only:
                         output = video.parent
                         record = {"video": str(video.resolve())}
@@ -873,7 +900,7 @@ def prepare(args, *, video_only=False):
                           f"  Ready: {len(record['windows'])} aligned tokens", flush=True)
                 except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
                     report["failures"].append({"index": index, "clip": clip.__dict__, "error": str(exc)})
-                    if isinstance(exc, (WhisperSetupError, DownloadSetupError, ArchiveAccessError)):
+                    if isinstance(exc, (WhisperSetupError, DownloadSetupError, ArchiveAccessError, ShofoAccessError)):
                         raise
                     if isinstance(exc, SourceUnavailableError):
                         report["unavailable_sources"][clip.source_key] = str(exc)
@@ -929,21 +956,28 @@ def training_command(args):
 def validate_args(parser, args):
     import train
 
-    if args.num_videos is None and not (args.num_pretrain is not None and args.prepare_only):
-        parser.error("--num-videos/-N is required except with --login, --logout, or --N-pretrain --prepare-only")
+    if args.num_videos is None and not args.pretrain_only and not (args.num_pretrain is not None and args.prepare_only):
+        parser.error("--num-videos/-N is required except with --login, --logout, --pretrain-only, or --N-pretrain --prepare-only")
     args.work_dir = (args.work_dir or ROOT / "data" / args.dataset).expanduser().resolve()
-    if args.dataset == "hdtf":
+    if args.dataset in ("hdtf", "shofo"):
         if args.metadata != DEFAULT_METADATA:
-            parser.error("--metadata is for TalkVid; use --hdtf-archive for HDTF")
+            parser.error("--metadata is for TalkVid; use --hdtf-archive for HDTF or --shofo-revision for Shofo")
         if any(language.casefold() not in ("english", "en") for language in args.dataset_language):
-            parser.error("HDTF is an English dataset; --dataset-language must be English or en")
+            parser.error(f"{args.dataset} is an English dataset; --dataset-language must be English or en")
+    if args.dataset == "shofo" and not args.shofo_revision.strip():
+        parser.error("--shofo-revision must not be empty")
+    if args.dataset == "hdtf":
         if urlparse(args.hdtf_archive).scheme not in ("http", "https"):
             archive_path = Path(args.hdtf_archive).expanduser().resolve()
             if not archive_path.is_file():
                 parser.error(f"HDTF archive not found: {archive_path}")
             args.hdtf_archive = str(archive_path)
-    args.manifest = (Path(args.manifest).expanduser().resolve() if args.manifest
-                     else args.work_dir / "data.jsonl")
+    if args.manifest:
+        args.manifest = Path(args.manifest).expanduser().resolve()
+    elif not args.pretrain_only or args.num_videos is not None:
+        args.manifest = args.work_dir / "data.jsonl"
+    if args.pretrain_only:
+        args.pretrain_visual_encoder = True
     if args.num_pretrain is not None or args.pretrain_manifest:
         args.pretrain_visual_encoder = True
         args.pretrain_manifest = (str(Path(args.pretrain_manifest).expanduser().resolve())
@@ -989,23 +1023,26 @@ def validate_args(parser, args):
         parser.error("--confidence-only requires --resume and --confidence-epochs > 0")
     if args.epochs < 0 or args.confidence_epochs < 0:
         parser.error("--epochs and --confidence-epochs must be >= 0")
-    pretrain_only = args.pretrain_visual_encoder and args.confidence_epochs == 0
+    pretrain_only = args.pretrain_only or (args.pretrain_visual_encoder and args.confidence_epochs == 0)
     if args.epochs == 0 and not args.resume and not args.prepare_only and not pretrain_only:
         parser.error("--epochs 0 requires --resume")
     if args.fine_tune_pretrained_lm and not (args.resume or args.pretrained_lm):
         parser.error("--fine-tune-pretrained-lm requires --pretrained-lm or a compatible --resume")
+    downloading = args.num_videos is not None or args.num_pretrain is not None
     dependencies = ["faster_whisper"] if args.num_videos is not None else []
-    if args.dataset == "talkvid":
+    if downloading and args.dataset == "talkvid":
         dependencies.extend(["yt_dlp", "ijson"])
+    elif downloading and args.dataset == "shofo":
+        dependencies.append("huggingface_hub")
     missing = [name for name in dependencies
                if importlib.util.find_spec(name) is None]
     if missing:
         parser.error(f"Missing dependencies: {', '.join(missing)}. Install with: "
                      f"{sys.executable} -m pip install -r {ROOT / 'requirements-downvid.txt'}")
-    for binary in ("ffmpeg", "ffprobe"):
+    for binary in ("ffmpeg", "ffprobe") if downloading else ():
         if shutil.which(binary) is None:
             parser.error(f"{binary} is required; install FFmpeg and make it available on PATH")
-    if args.dataset == "talkvid":
+    if downloading and args.dataset == "talkvid":
         validate_download_runtimes(args)
 
 
@@ -1014,7 +1051,8 @@ def main(argv=None):
     parser = build_argparser()
     args = parser.parse_args(argv)
     if args.dataset != "talkvid" and (args.login or args.logout):
-        parser.error("--login/--logout manage YouTube cookies for --dataset talkvid; HDTF needs no login")
+        parser.error("--login/--logout manage YouTube cookies for --dataset talkvid; "
+                     "Shofo uses hf auth login or HF_TOKEN, and HDTF needs no login")
     if args.login:
         login(args)
         return

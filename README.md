@@ -8,7 +8,7 @@ The model consumes video and text history; audio is used only when preparing
 transcripts and alignments with the optional ASR pipeline.
 
 The repository supports training on your own aligned videos or preparing clips
-from TalkVid or HDTF, experimenting with five fusion/loss variants, and running cached
+from TalkVid, HDTF, or Shofo, experimenting with five fusion/loss variants, and running cached
 inference on video files. The default text encoder is learned from scratch at
 the character level; a Hugging Face causal language model can replace it.
 
@@ -87,7 +87,7 @@ python3 train.py \
 ```
 
 `data/train.jsonl` must describe your own videos and alignments. To create a
-dataset from TalkVid or HDTF, follow [Download videos and train](#download-videos-and-train).
+dataset from TalkVid, HDTF, or Shofo, follow [Download videos and train](#download-videos-and-train).
 The trainer selects CUDA when available and otherwise uses CPU; `--device`
 overrides that choice. On CUDA, add `--amp` to enable mixed precision.
 `--max-frames` bounds the video section size used during training; its
@@ -279,11 +279,27 @@ pairs stay within each section. To reproduce the former two-MSE objective, set
 the temporal and augmentation weights to `1` and the variance and covariance
 weights to `0`.
 
-To save after pretraining without running the supervised stages, add
-`--epochs 0 --confidence-epochs 0`. The aligned `--manifest` is still required
-to initialize the supervised tokenizer for the checkpoint. Resume with
-`--resume checkpoints/cesm.pt`; omitting both pretraining flags starts supervised
-training directly, while including them runs additional pretraining epochs.
+To save after pretraining without running the supervised stages, use
+`--pretrain-only`. It enables visual pretraining, overrides `--epochs` and
+`--confidence-epochs` to zero, and skips supervised metrics and learning curves.
+An aligned `--manifest` is optional in this mode:
+
+```bash
+python3 train.py --pretrain-only --pretrain-manifest data/unlabeled.jsonl \
+  --pretrain-epochs 5 --output checkpoints/pretrained.pt
+
+python3 train.py --manifest data/train.jsonl --resume checkpoints/pretrained.pt \
+  --epochs 50 --confidence-epochs 10 --output checkpoints/cesm.pt
+```
+
+Omit `--pretrain-only`, `--pretrain-visual-encoder`, and `--pretrain-manifest`
+when resuming into full training. Supplying pretraining flags again requests
+additional pretraining; `--pretrain-only --resume ...` stops after that stage
+again. When no aligned manifest was supplied, the learned character vocabulary
+is initialized from the first supervised manifest on resume, preserving the
+pretrained video encoder. With an aligned manifest, the vocabulary is fixed
+during pretraining. A pretrained LM's tokenizer is always preserved.
+The older `--epochs 0 --confidence-epochs 0` recipe still works with an aligned manifest.
 The checkpoint preserves the cumulative `pretrain_epoch` count. Changing the
 video encoder clears any previously trained confidence status. All four weights,
 the variance floor, and the original-image probability are recorded in
@@ -302,6 +318,25 @@ python3 train_downvid.py --dataset hdtf -N 20 --N-pretrain 100 \
 python3 run_all_variants.py -N 20 --N-pretrain 100 --N-valid 5 \
   --dataset-language English --run-dir runs/pretrained_variants
 ```
+
+To split pretraining and full training into separate downloader invocations:
+
+```bash
+python3 train_downvid.py --dataset hdtf --pretrain-only --N-pretrain 100 \
+  --work-dir data/hdtf --pretrain-epochs 5 --output checkpoints/pretrained.pt
+
+python3 train_downvid.py --dataset hdtf -N 20 --resume checkpoints/pretrained.pt \
+  --work-dir data/hdtf --epochs 50 --confidence-epochs 10 --output checkpoints/cesm.pt
+```
+
+This also works with `--dataset talkvid` or `--dataset shofo`, and through
+`train_talkvid.py`. The first invocation needs no `-N`, Whisper, or alignment.
+Use `--pretrain-manifest PATH` instead of `--N-pretrain` to reuse local videos;
+this requires no downloader dependencies. If `-N` is supplied alongside
+`--pretrain-only`, those aligned clips are also prepared to fix the vocabulary
+before saving the checkpoint. Repeat custom preprocessing/training options on
+resume, as with other checkpoints. The comparison runner requires supervised
+training and does not accept `--pretrain-only`.
 
 Pretraining downloads skip Whisper, tokenization, and frame alignment. They use
 the same dataset, language filter, start index, frame cap, and download cache as
@@ -415,7 +450,8 @@ state. Training options come from the current command, so repeat customized
 learning rates, loss weights, `--amp`, `--max-frames`, and `--no-face-detector`
 settings as needed. Supply `--output` explicitly; it does not default to the
 resume path. For a character checkpoint, the new training manifest must produce
-exactly the same character vocabulary.
+exactly the same character vocabulary, except when `--pretrain-only` deferred
+vocabulary initialization by omitting the aligned manifest.
 
 For a pretrained-LM checkpoint, the stored architecture and tokenizer are
 authoritative, so `--pretrained-lm` may be omitted; if supplied, its name must
@@ -655,7 +691,7 @@ hyperparameters, pass the desired value again when resuming training.
 ## Download videos and train
 
 `train_downvid.py` downloads **N usable videos/clips** from `--dataset talkvid`
-(the default) or `--dataset hdtf`, uses
+(the default), `--dataset hdtf`, or `--dataset shofo`, uses
 `grouper.py` to transcribe speech and group frames,
 writes `data.jsonl`, then launches this repository's `train.py`. TalkVid's
 [official download instructions](https://github.com/FreedomIntelligence/TalkVid/tree/main/data_pipeline/0_video_download)
@@ -687,7 +723,7 @@ Every `train.py` argument is available, including `--pretrained-lm`, `--amp`,
 the checkpoint path. `--manifest` is optional here and sets
 the **generated** JSONL destination; it defaults to `WORK_DIR/data.jsonl`.
 Relative CLI paths resolve from your current directory. With no `--work-dir`,
-the default is `data/talkvid` or `data/hdtf` beside the script, according to
+the default is `data/talkvid`, `data/hdtf`, or `data/shofo` beside the script, according to
 `--dataset`. The old `train_talkvid.py` command remains a compatibility entry point.
 
 The grouping code defaults to `grouper.py` in the same folder as
@@ -739,6 +775,50 @@ media or alignment candidates are replaced until N are usable. Archive access
 errors stop the run; servers that ignore byte ranges require a local archive.
 Reruns reuse completed videos and alignments, but still read the archive index.
 
+### Shofo: hosted English talking-head videos
+
+`--dataset shofo` downloads selected MP4s from
+[Shofo/shofo-talking-head-en](https://huggingface.co/datasets/Shofo/shofo-talking-head-en).
+This is a gated dataset: request/accept access on its Hugging Face page, then
+authenticate an approved account using `hf auth login` or the `HF_TOKEN`
+environment variable. YouTube cookies and the wrapper's `--login`/`--logout`
+options do not apply. No yt-dlp or JavaScript runtime is needed.
+
+```bash
+python3 -m pip install -r requirements-downvid.txt
+hf auth login
+
+python3 train_downvid.py --dataset shofo -N 100 \
+  --download-max-frames 256 --language en --prepare-only
+
+python3 run_all_variants.py --dataset shofo -N 100 --N-valid 20 \
+  --download-max-frames 256 --language en \
+  --max-frames 128 --batch-size 2 --epochs 50 \
+  --run-dir runs/shofo_comparison
+```
+
+The downloader reads the repository file listing and selects `videos/**/*.mp4`
+in filename order. It fetches only selected videos, without downloading the
+whole dataset or its Parquet metadata. `--shofo-revision BRANCH_TAG_OR_COMMIT`
+defaults to `main`; each preparation pass resolves it to a commit and pins its
+downloads to that version. Use a commit hash to reproduce selection across runs.
+Completed videos and alignments are cached under `data/shofo` by default.
+
+`--start-index`, `--max-attempts`, `--download-timeout`, `--download-retries`,
+`--N-pretrain`, and training options work as with the other sources. English
+and `en` are the only accepted `--dataset-language` filters. Each selected MP4
+is downloaded in full, checked against its listed size and audio/video streams,
+then optionally trimmed with matching audio by `--download-max-frames`.
+Frame limiting reduces saved/preprocessed content, not network transfer size.
+Whisper generates the training alignments; Shofo's supplied transcripts are
+not used. Pretraining-only preparation skips Whisper and alignment.
+
+Invalid media and alignment failures are replaced until N clips are usable.
+Authentication/access failures stop immediately with setup instructions.
+Source IDs remain stable across revisions and frame caps, allowing validation
+downloads to exclude training/pretraining videos. Tokens are not written to
+clip caches, manifests, or run reports.
+
 ### Downloader runtime (TalkVid only)
 
 YouTube extraction needs a supported JavaScript runtime and yt-dlp's EJS scripts.
@@ -755,15 +835,17 @@ to select a runtime outside PATH. Authentication can be supplied using
 
 | Option | Meaning |
 | --- | --- |
-| `--dataset talkvid` / `--dataset hdtf` | Select the source; TalkVid remains the default. |
+| `--dataset talkvid` / `--dataset hdtf` / `--dataset shofo` | Select the source; TalkVid remains the default. |
 | `--hdtf-archive PATH_OR_URL` | HDTF MP4 ZIP; defaults to the hosted `videos.zip`. |
-| `--num-videos N` / `-N N` | Number of successfully downloaded and aligned training clips; required except for login/logout or pretraining-only preparation. |
+| `--shofo-revision BRANCH_TAG_OR_COMMIT` | Shofo Hugging Face revision; defaults to `main`. Uses `hf auth login` or `HF_TOKEN`. |
+| `--num-videos N` / `-N N` | Number of successfully downloaded and aligned training clips; required except for login/logout, `--pretrain-only`, or pretraining-only preparation. |
 | `--N-pretrain N` | Download N unannotated videos independently of `-N` and enable visual pretraining. |
+| `--pretrain-only` | Save after visual pretraining; use `--N-pretrain` or `--pretrain-manifest`. Resume without pretraining flags for full training. |
 | `--pretrain-manifest PATH` | Reuse pretraining videos, or choose their output manifest with `--N-pretrain`. |
 | `--prepare-only` | Create the dataset without launching training. |
 | `--metadata PATH_OR_URL` | TalkVid: override metadata with a JSON array or JSONL file/URL. |
 | `--dataset-language English` | Filter metadata by language name; repeat to include several languages. |
-| `--start-index N` | Skip N TalkVid metadata rows or N HDTF videos in filename order. |
+| `--start-index N` | Skip N TalkVid metadata rows or N HDTF/Shofo videos in filename order. |
 | `--exclude-manifest PATH` | Exclude matching video paths and known source uploads during preparation. |
 | `--max-attempts N` | Limit eligible, distinct clips attempted per preparation pass; default is `10 * max(N, N-pretrain)`. |
 | `--whisper-model small` | faster-whisper model name, size, or local directory. |
@@ -842,7 +924,8 @@ to avoid ambiguous character/token counts. The trainer's repair of
 isolated zero-frame windows is checked before admitting a clip; irreparable
 alignments are skipped. When resuming a learned character model, the prepared
 transcripts must produce exactly the checkpoint's character vocabulary, as
-required by `train.py`. Whisper runs in a separate process that exits before
+required by `train.py`, unless unlabeled-only pretraining deferred its initialization.
+Whisper runs in a separate process that exits before
 training, releasing its GPU memory.
 
 For example, prepare a Spanish dataset using CPU ASR and a pretrained tokenizer:
@@ -1105,9 +1188,10 @@ YouTube authentication and does not explain these player errors.
 | [`infer.py`](infer.py) | Cached, incremental inference and confidence-based token commitment. |
 | [`streaming.py`](streaming.py) | Decoder and commit options shared by inference and streaming accuracy. |
 | [`learning_curves.py`](learning_curves.py) | Per-epoch loss/accuracy CSVs, plots, and decoder-option routing. |
-| [`train_downvid.py`](train_downvid.py) | TalkVid/HDTF download, alignment, caching, and training wrapper. |
+| [`train_downvid.py`](train_downvid.py) | TalkVid/HDTF/Shofo download, alignment, caching, and training wrapper. |
 | [`train_talkvid.py`](train_talkvid.py) | Compatibility entry point for `train_downvid.py`. |
 | [`hdtf_download.py`](hdtf_download.py) | Local/HTTP-range ZIP access and HDTF member extraction. |
+| [`shofo_download.py`](shofo_download.py) | Shofo hosted MP4 selection, Hugging Face authentication, and downloads. |
 | [`grouper.py`](grouper.py) | Speech transcription and grouping frames by character or LM token. |
 | [`run_all_variants.py`](run_all_variants.py) | Shared-dataset orchestration for the five experiments. |
 | [`flash_mono.py`](flash_mono.py) | Streamed monotonic and aligned-window attention statistics. |
@@ -1125,7 +1209,7 @@ run the regression suite from the repository root:
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Tests cover download recovery/caching, HDTF archive access, alignment, variant
+Tests cover download recovery/caching, HDTF archive access, Shofo authentication/downloads, alignment, variant
 routing, validation and early stopping, visual pretraining, streaming decoding,
 and learning curves. Model integration checks use tiny synthetic videos and
 CPU models; download/ASR checks use mocks or fixtures rather than remote datasets

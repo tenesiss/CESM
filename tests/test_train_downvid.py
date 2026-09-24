@@ -470,6 +470,118 @@ class DownloadFrameLimitIntegrationTests(PipelineFixture):
 
 
 class PretrainingPreparationTests(PipelineFixture):
+    def test_pretrain_only_download_handoff_for_all_sources(self):
+        for dataset in ("talkvid", "hdtf", "shofo"):
+            preparations, commands, dependencies = [], [], []
+
+            def dependency(name):
+                dependencies.append(name)
+                return None if name == "faster_whisper" else object()
+
+            def prepare(args, *, video_only=False):
+                preparations.append((args.num_videos, args.manifest, video_only))
+
+            def run(command, **kwargs):
+                commands.append(command)
+                if "--prepare-only" in command:
+                    pipeline.main(command[2:])
+
+            with self.subTest(dataset=dataset), \
+                    patch.object(pipeline.importlib.util, "find_spec", side_effect=dependency), \
+                    patch.object(pipeline, "validate_download_runtimes"), \
+                    patch.object(pipeline.shutil, "which", return_value="tool"), \
+                    patch.object(pipeline, "prepare", side_effect=prepare), \
+                    patch.object(pipeline.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+                pipeline.main(["--dataset", dataset, "--pretrain-only", "--N-pretrain", "2",
+                               "--work-dir", str(self.root), "--group-frames-code", str(self.root / "missing.py"),
+                               "--epochs", "0", "--pretrain-epochs", "3"])
+            self.assertEqual(preparations, [(2, self.root / "pretrain.jsonl", True)])
+            self.assertNotIn("faster_whisper", dependencies)
+            forwarded = train.build_argparser().parse_args(commands[-1][2:])
+            self.assertTrue(forwarded.pretrain_only)
+            self.assertTrue(forwarded.pretrain_visual_encoder)
+            self.assertIsNone(forwarded.manifest)
+            self.assertEqual(forwarded.pretrain_epochs, 3)
+            self.assertEqual(forwarded.pretrain_manifest, str(self.root / "pretrain.jsonl"))
+
+    def test_pretrain_only_reuses_manifest_without_download_dependencies(self):
+        manifest = self.root / "unlabeled.jsonl"
+        manifest.write_text(json.dumps({"video": "clip.avi"}) + "\n")
+        parser = pipeline.build_argparser()
+        args = parser.parse_args(["--pretrain-only", "--pretrain-manifest", str(manifest)])
+        with patch.object(pipeline.importlib.util, "find_spec", side_effect=AssertionError("download dependency")), \
+                patch.object(pipeline, "validate_download_runtimes", side_effect=AssertionError("download runtime")), \
+                patch.object(pipeline.shutil, "which", side_effect=AssertionError("download binary")):
+            pipeline.validate_args(parser, args)
+        self.assertIsNone(args.manifest)
+        self.assertTrue(args.pretrain_visual_encoder)
+
+    def test_pretrain_only_invalid_combinations_fail_before_download(self):
+        for flags in (["--pretrain-only"], ["--pretrain-only", "--N-pretrain", "1", "--confidence-only"],
+                      ["--pretrain-only", "--pretrain-manifest", str(self.root / "missing.jsonl")],
+                      ["--N-pretrain", "1"]):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), \
+                    patch.object(pipeline.subprocess, "run") as run, self.assertRaises(SystemExit):
+                pipeline.main(flags)
+            run.assert_not_called()
+
+    def test_unlabeled_pretraining_then_full_resume_through_pipeline(self):
+        video = self.root / "clip.avi"
+        writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 25, (32, 32))
+        self.assertTrue(writer.isOpened())
+        try:
+            for i in range(5):
+                writer.write(np.full((32, 32, 3), i * 40, dtype=np.uint8))
+        finally:
+            writer.release()
+        preparations = []
+
+        def prepare(args, *, video_only=False):
+            preparations.append(video_only)
+            row = {"video": str(video)}
+            if not video_only:
+                _, unit, _, resume_chars = pipeline.alignment_tokenizer(args)
+                self.assertEqual(unit, "character")
+                self.assertIsNone(resume_chars)  # The supervised vocabulary has not been set yet.
+                row.update(text="ab", windows=[[0, 1], [2, 4]])
+            args.manifest.write_text(json.dumps(row) + "\n")
+
+        def run(command, **kwargs):
+            if "--prepare-only" in command:
+                pipeline.main(command[2:])
+            else:
+                train.train(train.build_argparser().parse_args(command[2:]))
+
+        checkpoint = self.root / "model.pt"
+        common = ["--dataset", "hdtf", "--work-dir", str(self.root), "--output", str(checkpoint),
+                  "--device", "cpu", "--epochs", "1", "--confidence-epochs", "1", "--batch-size", "1",
+                  "--mouth-size", "16", "--d-video", "8", "--d-text", "8", "--d-fusion", "8",
+                  "--heads", "2", "--video-layers", "1", "--text-layers", "1", "--conv3d-channels", "4",
+                  "--no-face-detector", "--no-plot-learning-curves"]
+        find_spec = importlib.util.find_spec
+        threads = torch.get_num_threads()
+        try:
+            torch.set_num_threads(1)
+            with patch.object(pipeline, "prepare", side_effect=prepare), \
+                    patch.object(pipeline.subprocess, "run", side_effect=run), \
+                    patch.object(pipeline.importlib.util, "find_spec",
+                                 side_effect=lambda name: object() if name == "faster_whisper" else find_spec(name)), \
+                    patch.object(pipeline.shutil, "which", return_value="tool"), contextlib.redirect_stdout(io.StringIO()):
+                pipeline.main([*common, "--pretrain-only", "--N-pretrain", "1", "--pretrain-epochs", "1"])
+                saved = torch.load(checkpoint, weights_only=False)
+                self.assertEqual(saved["training_stage"], "pretrain")
+                self.assertTrue(saved["tokenizer_pending"])
+                pipeline.main([*common, "-N", "1", "--resume", str(checkpoint)])
+        finally:
+            torch.set_num_threads(threads)
+        self.assertEqual(preparations, [True, False])
+        saved = torch.load(checkpoint, weights_only=False)
+        self.assertEqual((saved["pretrain_epoch"], saved["epoch"], saved["confidence_epoch"]), (1, 1, 1))
+        self.assertTrue(saved["confidence"]["trained"])
+        self.assertFalse(saved["tokenizer_pending"])
+        args = self.args("--resume", str(checkpoint))
+        self.assertEqual(pipeline.alignment_tokenizer(args)[-1], saved["tokenizer"]["itos"])
+
     def test_invalid_loss_parameters_fail_before_download_dependencies(self):
         for flag, value in (("--lambda-pretrain-temporal", "-1"),
                             ("--lambda-pretrain-augmentation", "nan"),

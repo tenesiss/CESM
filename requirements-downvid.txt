@@ -2,3 +2,4 @@
 faster-whisper>=1.1
 yt-dlp[default]>=2026.8.19
 ijson>=3.3
+huggingface-hub>=0.34

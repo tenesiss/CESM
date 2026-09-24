@@ -95,7 +95,7 @@ manifest and output paths resolve from the current working directory.
 
 ## All-in-one download, train and evaluate
 
-From the repository root, run `run_all_variants.py` to download and align TalkVid or HDTF
+From the repository root, run `run_all_variants.py` to download and align TalkVid, HDTF, or Shofo
 **once**, then train and evaluate the selected variants (1–5 by default) sequentially on **the exact same
 manifest samples**. Each variant's CSV is saved before the next variant starts:
 
@@ -121,6 +121,20 @@ HDTF also accepts `--hdtf-archive PATH_OR_URL` for a local or alternate ZIP.
 The download stage calls `train_downvid.py` once and shares the resulting exact
 sample manifest with all variants. HDTF transfers each selected compressed ZIP
 member, then applies the frame cap locally and trims audio before alignment.
+
+For [Shofo/shofo-talking-head-en](https://huggingface.co/datasets/Shofo/shofo-talking-head-en),
+request/accept dataset access and authenticate with `hf auth login` or `HF_TOKEN`,
+then use `--dataset shofo` (default cache: `data/shofo`). For example:
+
+```bash
+python3 run_all_variants.py --dataset shofo -N 100 --N-valid 20 \
+  --download-max-frames 256 --max-frames 128 --language en \
+  --run-dir runs/shofo_comparison --epochs 50 --batch-size 2
+```
+
+`--shofo-revision` selects a branch, tag, or commit. Each selected MP4 is fetched
+in full and optionally trimmed locally; Hugging Face access failures stop the
+run. See the [Shofo setup instructions](../README.md#shofo-hosted-english-talking-head-videos).
 
 Install FFmpeg (`ffmpeg` and `ffprobe`); only TalkVid requires a supported
 yt-dlp JavaScript runtime, as described in the repository README. All TalkVid download/alignment options
@@ -216,7 +230,7 @@ paths; validation metrics go to `CHECKPOINT_STEM.validation.metrics.csv` and
 definitions below, which differ from the total objective used for checkpoint selection.
 
 Choose either `-N` or `--manifest`. `--work-dir` controls the reusable dataset
-cache (default: `data/talkvid` or `data/hdtf`); `--run-dir` holds this experiment's outputs and must be empty or new.
+cache (default: `data/talkvid`, `data/hdtf`, or `data/shofo`); `--run-dir` holds this experiment's outputs and must be empty or new.
 If omitted, a new timestamped directory under `runs/` is used. Paths passed on
 the CLI resolve from the current directory, so invoking the runner by its
 absolute path from elsewhere also works.
@@ -226,7 +240,7 @@ With all five variants selected, the runner creates:
 ```text
 RUN_DIR/
   samples.jsonl                    # Fixed sample order, labels and absolute video paths
-  <dataset>.jsonl                  # talkvid.jsonl or hdtf.jsonl in download mode
+  <dataset>.jsonl                  # talkvid.jsonl, hdtf.jsonl, or shofo.jsonl in download mode
   checkpoints/test_1_as_is.pt
   checkpoints/test_2_tcross_loss.pt
   checkpoints/test_3_no_ht0.pt

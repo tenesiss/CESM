@@ -16,6 +16,7 @@
 !train_talkvid.py
 !train_downvid.py
 !hdtf_download.py
+!shofo_download.py
 !flash_mono.py
 !tests/
 !tests/evaluate_checkpoints.py
@@ -25,6 +26,7 @@
 !tests/test_validation.py
 !tests/test_train_downvid.py
 !tests/test_hdtf_download.py
+!tests/test_shofo_download.py
 !tests/test_fusion_options.py
 !tests/test_window_phasing.py
 !tests/test_infer_cooldown.py

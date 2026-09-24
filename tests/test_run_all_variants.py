@@ -139,6 +139,24 @@ class AllVariantRunnerTests(unittest.TestCase):
             self.assertEqual(training.max_frames, 25)
             self.assertNotIn("--dataset=hdtf", stage["command"])
 
+    def test_shofo_revision_routes_to_all_download_stages_only(self):
+        prepared, _, _, stages = self.plan([
+            "--dataset", "shofo", "-N", "2", "--N-valid", "1", "--N-pretrain", "3",
+            "--shofo-revision", "release", "--download-max-frames", "50",
+            "--start-index", "7", "--download-timeout", "90", "--download-retries", "2",
+        ])
+        self.assertEqual(prepared.name, "shofo.jsonl")
+        for stage in stages:
+            if stage["name"].startswith("download"):
+                args = train_downvid.build_argparser().parse_args(stage["command"][2:])
+                self.assertEqual((args.dataset, args.shofo_revision), ("shofo", "release"))
+                self.assertEqual((args.start_index, args.download_max_frames), (7, 50))
+                self.assertEqual((args.download_timeout, args.download_retries), (90, 2))
+                self.assertTrue(args.prepare_only)
+            else:
+                self.assertNotIn("--dataset=shofo", stage["command"])
+                self.assertNotIn("--shofo-revision=release", stage["command"])
+
     def test_validation_download_and_reused_manifests_route_to_selected_variants(self):
         for source in (["-N", "3"], ["--manifest", "existing.jsonl"]):
             for validation in (["--N-valid", "2"], ["--validation-manifest", "validation.jsonl"]):
@@ -197,6 +215,8 @@ class AllVariantRunnerTests(unittest.TestCase):
             ["-N", "1", "--N-pretrain", "-1"],
             ["-N", "1", "--N-pretrain", "2", "--pretrain-manifest", "other.jsonl"],
             ["-N", "1", "--pretrain-visual-encoder"],
+            ["-N", "1", "--N-pretrain", "2", "--pretrain-only"],
+            ["-N", "1", "--N-pretrain", "2", "--variant-args", "1:--pretrain-only"],
             ["-N", "1", "--N-pretrain", "2", "--pretrain-epochs", "0"],
             ["-N", "1", "--N-pretrain", "2", "--pretrain-adjacent-frames", "1"],
             ["-N", "1", "--lambda-pretrain-temporal", "-1"],
@@ -213,7 +233,7 @@ class AllVariantRunnerTests(unittest.TestCase):
                 self.plan(flags)
 
     def test_pretraining_download_count_and_shared_manifest_route_separately(self):
-        for dataset in ("talkvid", "hdtf"):
+        for dataset in ("talkvid", "hdtf", "shofo"):
             with self.subTest(dataset=dataset):
                 _, _, _, stages = self.plan([
                     "-N", "2", "--N-pretrain", "7", "--N-valid", "3", "--dataset", dataset,

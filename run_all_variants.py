@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prepare one video dataset, then train and evaluate selected variants on the same samples.
 
-Use -N with --dataset talkvid/hdtf, or --manifest to reuse a prepared dataset. Training
+Use -N with --dataset talkvid/hdtf/shofo, or --manifest to reuse a prepared dataset. Training
 options apply to all compatible selected variants; --variants selects which to run
 (default: all five), and --variant-args provides per-variant
 overrides. Each stage runs in its own process to release model/GPU memory.
@@ -150,6 +150,8 @@ def variant_overrides(parser, specifications):
 
 
 def validate_training_args(parser, args):
+    if args.pretrain_only:
+        parser.error("--pretrain-only is supported by train.py and train_downvid.py; the variant runner requires supervised training")
     try:
         train.validate_early_stopping_args(args)
         train.validate_pretraining_args(args)
