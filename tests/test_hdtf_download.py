@@ -6,8 +6,10 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import zipfile
 from http.client import IncompleteRead
+from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import patch
 import unittest
@@ -56,6 +58,13 @@ class RangeArchiveTests(unittest.TestCase):
             with archive_io.HTTPRangeReader("https://example.test/a.zip", 30, 0) as reader:
                 with self.assertRaisesRegex(archive_io.ArchiveAccessError, "changed"):
                     reader.read(2)
+
+    def test_independent_reader_rejects_change_from_listing_identity(self):
+        payload = self.archive_bytes()
+        with patch.object(archive_io, "urlopen", return_value=self.response(payload, 0, 0, etag='"changed"')):
+            with self.assertRaisesRegex(archive_io.ArchiveAccessError, "changed"):
+                archive_io.HTTPRangeReader("https://example.test/a.zip", 30, 0,
+                                           identity=(len(payload), '"archive-v1"'))
 
     def test_transient_http_retry_and_nonretryable_access_failure(self):
         payload = self.archive_bytes()
@@ -166,6 +175,44 @@ class HDTFTests(PipelineFixture):
         self.assertTrue(all(set(row) == {"video", "source_key"} for row in rows))
         report = pipeline.read_cache(self.root / "pretrain_report.json")
         self.assertEqual((report["usable"], report["attempts"]), (2, 3))
+
+    def test_parallel_http_members_use_independent_readers_and_close_them(self):
+        args = self.hdtf_args("-N", "2", "--start-index", "1", "--download-workers", "2",
+                              "--hdtf-archive", "https://example.test/videos.zip")
+        payload = self.zip_path.read_bytes()
+        barrier = threading.Barrier(2)
+        readers = []
+        copy = pipeline.copy_video
+
+        def respond(request, **kwargs):
+            start, end = map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", request.get_header("Range")).groups())
+            return RangeArchiveTests().response(payload, start, end)
+
+        def transfer(archive, member, output, timeout):
+            readers.append(archive.fp)
+            barrier.wait(timeout=5)
+            return copy(archive, member, output, timeout)
+
+        with patch.object(archive_io, "urlopen", side_effect=respond), \
+                patch.object(pipeline, "copy_video", side_effect=transfer), \
+                contextlib.redirect_stdout(io.StringIO()):
+            pipeline.prepare(args, video_only=True)
+        self.assertEqual(len(readers), 2)
+        self.assertIsNot(readers[0], readers[1])
+        self.assertTrue(all(reader.closed for reader in readers))
+        for row in train.load_manifest(args.manifest, video_only=True):
+            self.assertEqual(Path(row["video"]).read_bytes(), self.source.read_bytes())
+
+    def test_independent_archive_rejects_member_changed_after_listing(self):
+        args = self.hdtf_args("--start-index", "1")
+        with contextlib.closing(pipeline.iter_hdtf(args)) as rows:
+            next(rows)
+            selected = next(rows)
+        with zipfile.ZipFile(self.zip_path, "w") as archive:
+            archive.writestr(selected["clip"].member, b"replacement")
+        with self.assertRaisesRegex(archive_io.ArchiveAccessError, "changed"):
+            pipeline.download_hdtf_clip(selected["clip"], args, member=selected["member"])
+        self.assertIsNone(pipeline.cached_download(selected["clip"], args))
 
     def test_shortfall_preserves_final_manifest_and_start_index(self):
         args = self.hdtf_args("-N", "2", "--start-index", "3", "--download-max-frames", "12")

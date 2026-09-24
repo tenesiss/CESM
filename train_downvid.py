@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import io
@@ -25,14 +26,17 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import warnings
 import zipfile
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from hdtf_download import DEFAULT_HDTF_ARCHIVE, ArchiveAccessError, copy_video, open_archive
+from hdtf_download import DEFAULT_HDTF_ARCHIVE, ArchiveAccessError, HTTPRangeReader, copy_video, open_archive
 from shofo_download import SHOFO_REPO, ShofoAccessError, ShofoClip, copy_shofo_video, iter_shofo
 
 
@@ -97,6 +101,15 @@ def build_argparser():
     group.add_argument("--download-timeout", type=positive_int, default=600,
                        help="Per-clip download timeout in seconds")
     group.add_argument("--download-retries", type=int, default=3)
+    group.add_argument("--download-workers", type=positive_int, default=4,
+                       help="Concurrent HDTF/Shofo downloads (default: 4; 1 disables prefetch). "
+                            "TalkVid downloads remain sequential")
+    group.add_argument("--alignment-workers", type=positive_int, default=4,
+                       help="Concurrent transcription/frame-alignment jobs (default: 4); "
+                            "higher counts use more RAM/VRAM")
+    group.add_argument("--sequential-alignment", action="store_true",
+                       help="Align one clip at a time, overriding --alignment-workers; "
+                            "downloads can still run in parallel")
     group.add_argument("--download-format", default=DEFAULT_FORMAT,
                        help="yt-dlp format selector; must include video AND audio")
     group.add_argument("--download-max-frames", type=positive_int, metavar="N",
@@ -351,16 +364,34 @@ def iter_hdtf(args):
                         key=lambda member: member.filename)
         if not videos:
             raise ArchiveAccessError("HDTF ZIP contains no MP4 videos")
+        identity = ((archive.fp.size, archive.fp.etag)
+                    if isinstance(archive.fp, HTTPRangeReader) else None)
         print(f"HDTF archive: {len(videos)} videos; selecting in filename order", flush=True)
         for member in videos:
             yield {"id": member.filename, "info": {"Language": "English"},
                    "clip": ArchiveClip(args.hdtf_archive, member.filename, member.CRC, member.file_size),
-                   "archive": archive, "member": member}
+                   "archive": archive, "member": member, "archive_identity": identity}
 
 
-def download_hdtf_clip(clip, args, archive, member):
-    return download_hosted_clip(clip, args, "hdtf", clip.member,
-                                lambda output: copy_video(archive, member, output, args.download_timeout))
+def download_hdtf_clip(clip, args, archive=None, member=None, *, identity=None):
+    def copy_source(output):
+        if archive is not None:
+            copy_video(archive, member, output, args.download_timeout)
+            return
+        # Each concurrent transfer owns its seek position, deadline and ZIP lock.
+        with open_archive(clip.url, args.download_timeout, args.download_retries,
+                          identity=identity) as independent:
+            try:
+                current = independent.getinfo(clip.member)
+            except KeyError:
+                raise ArchiveAccessError("HDTF archive changed during download; rerun preparation") from None
+            if ((current.CRC, current.file_size) != (clip.crc, clip.size) or
+                    (member is not None and (current.header_offset, current.compress_size) !=
+                     (member.header_offset, member.compress_size))):
+                raise ArchiveAccessError("HDTF archive changed during download; rerun preparation")
+            copy_video(independent, current, output, args.download_timeout)
+
+    return download_hosted_clip(clip, args, "hdtf", clip.member, copy_source)
 
 
 def download_shofo_clip(clip, args):
@@ -775,10 +806,216 @@ def training_record(manifest, tokenizer, window_unit, video):
             "window_unit": window_unit}
 
 
+def eligible_clips(args, report, excluded, languages):
+    """Select on the coordinator thread so exclusions and deduplication stay ordered."""
+    candidates = (iter_hdtf(args) if args.dataset == "hdtf" else
+                  iter_shofo(args) if args.dataset == "shofo" else iter_metadata(args.metadata))
+    seen = set()
+    with contextlib.closing(candidates) as rows:
+        for index, row in enumerate(rows):
+            if index < args.start_index or not isinstance(row, dict):
+                continue
+            info = row.get("info") or {}
+            if languages and (not isinstance(info, dict) or
+                              str(info.get("Language", "")).casefold() not in languages):
+                continue
+            try:
+                clip = Clip.from_row(row) if args.dataset == "talkvid" else row["clip"]
+            except (TypeError, ValueError, AttributeError) as exc:
+                report["failures"].append({"index": index, "error": f"Invalid metadata: {exc}"})
+                continue
+            if clip.key in seen:
+                continue
+            seen.add(clip.key)
+            candidate_keys = {("source", clip.source_key),
+                              ("path", str((download_folder(clip, args) / "video.mp4").resolve()))}
+            if candidate_keys & excluded:
+                report["skipped_excluded_clips"] += 1
+                continue
+            if (clip.source_key in report["unavailable_sources"] and cached_download(clip, args) is None):
+                report["skipped_unavailable_clips"] += 1
+                continue
+            yield index, row, clip
+
+
+def download_candidate(clip, args, row):
+    if args.dataset == "hdtf":
+        return download_hdtf_clip(clip, args,
+                                  row["archive"] if args.download_workers == 1 else None,
+                                  row["member"], identity=row.get("archive_identity"))
+    if args.dataset == "shofo":
+        return download_shofo_clip(clip, args)
+    return download_clip(clip, args)
+
+
+def prefetched_clips(args, report, records, excluded, languages, *, reserved=lambda: 0):
+    """Bound outstanding transfers by workers, remaining clips and the attempt budget.
+
+    Futures are consumed in source order. Account for clips already handed to
+    alignment so both queues share the usable-clip budget. On exit, join transfers
+    before closing the source or letting a subsequent preparation pass start.
+    """
+    workers = args.download_workers if args.dataset in ("hdtf", "shofo") else 1
+    with contextlib.closing(eligible_clips(args, report, excluded, languages)) as rows:
+        if workers == 1:
+            while len(records) < args.num_videos and report["attempts"] < args.max_attempts:
+                candidate = next(rows, None)
+                if candidate is None:
+                    break
+                report["attempts"] += 1
+                yield (*candidate, report["attempts"], None)
+            return
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="downvid")
+        pending = deque()
+        exhausted = False
+        try:
+            while len(records) < args.num_videos:
+                capacity = min(workers, args.num_videos - len(records) - reserved())
+                fatal = any(item[-1].done() and isinstance(item[-1].exception(),
+                            (DownloadSetupError, ArchiveAccessError, ShofoAccessError)) for item in pending)
+                while (not exhausted and not fatal and len(pending) < capacity and
+                       report["attempts"] < args.max_attempts):
+                    candidate = next(rows, None)
+                    if candidate is None:
+                        exhausted = True
+                        break
+                    index, row, clip = candidate
+                    report["attempts"] += 1
+                    future = pool.submit(download_candidate, clip, args, row)
+                    pending.append((index, row, clip, report["attempts"], future))
+                if not pending:
+                    break
+                yield pending.popleft()
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+
+def alignment_worker_count(args, *, video_only=False):
+    if video_only:
+        return 0
+    return 1 if args.sequential_alignment else min(args.alignment_workers, args.num_videos)
+
+
+class ClipAligner:
+    """Share a concurrent Whisper model; keep tokenizer state local to each worker."""
+
+    def __init__(self, args, grouper, tokenizer, unit, config, workers):
+        self.args, self.grouper, self.tokenizer = args, grouper, tokenizer
+        self.unit, self.config, self.workers = unit, config, workers
+        self.config_key = digest(config)[:24]
+        self.local = threading.local()
+        self.lock = threading.Lock()
+        self.whisper = None
+        self.setup_error = None
+
+    def resources(self, *, model=False):
+        # Initialize once, lazily: fully cached runs do not load Whisper. Remember
+        # setup failures so other threads do not retry an unavailable model/device.
+        with self.lock:
+            if self.setup_error is not None:
+                raise AlignmentSetupError(self.setup_error)
+            if not hasattr(self.local, "tokenizer"):
+                try:
+                    self.local.tokenizer = (copy.deepcopy(self.tokenizer) if self.workers > 1
+                                            else self.tokenizer)
+                except Exception as exc:
+                    self.setup_error = f"Cannot initialize alignment tokenizer: {exc}"
+                    raise AlignmentSetupError(self.setup_error) from exc
+            if model and self.whisper is None:
+                try:
+                    options = {"num_workers": self.workers} if self.workers > 1 else {}
+                    self.whisper = self.grouper.WhisperModel(
+                        self.args.whisper_model, device=self.args.whisper_device,
+                        compute_type=self.args.whisper_compute_type, **options,
+                    )
+                except Exception as exc:
+                    self.setup_error = f"Cannot initialize Whisper: {exc}"
+                    raise WhisperSetupError(self.setup_error) from exc
+            return self.local.tokenizer, self.whisper
+
+    def __call__(self, clip, video):
+        args, grouper = self.args, self.grouper
+        output = args.work_dir / "frames" / clip.key / self.config_key
+        completed = output / "complete.json"
+        signature = video_signature(video)
+        cached = read_cache(completed) if not args.reprocess else None
+        manifest = read_cache(output / "manifest.json")
+        if cached and cached.get("video_signature") == signature and manifest:
+            print(f"  Reusing alignment: {output}", flush=True)
+            tokenizer, _ = self.resources()
+        else:
+            tokenizer, whisper = self.resources(model=True)
+            # A clip key is scheduled only once, so each worker owns its output.
+            if output.exists():
+                shutil.rmtree(output)
+            print(f"  Transcribing and grouping frames: {video}", flush=True)
+            manifest = grouper.group_frames_by_token(
+                video, tokenizer, output, whisper_model=args.whisper_model,
+                language=args.language, device=args.whisper_device,
+                compute_type=args.whisper_compute_type, image_ext=args.image_ext,
+                jpeg_quality=args.jpeg_quality, whisper_instance=whisper,
+            )
+        record = training_record(manifest, tokenizer, self.unit, video)
+        record["source_key"] = clip.source_key
+        grouper.write_jsonl([record], output / "data.jsonl")
+        write_json(completed, {"video_signature": signature, "config": self.config})
+        return record, output
+
+
+def prepared_clips(args, report, records, excluded, languages, aligner=None):
+    """Overlap two bounded stages, yielding completed preparation in source order."""
+    workers = report["alignment_workers"]
+    pending = deque()
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="alignment") if workers > 1 else None
+    downloads = prefetched_clips(args, report, records, excluded, languages, reserved=lambda: len(pending))
+    exhausted = halted = False
+    fatal_errors = (AlignmentSetupError, DownloadSetupError, ArchiveAccessError, ShofoAccessError)
+    try:
+        while len(records) < args.num_videos:
+            while (not exhausted and not halted and len(pending) < max(1, workers) and
+                   len(records) + len(pending) < args.num_videos):
+                if any(item[-1].done() and isinstance(item[-1].exception(), fatal_errors) for item in pending):
+                    halted = True
+                    break
+                candidate = next(downloads, None)
+                if candidate is None:
+                    exhausted = True
+                    break
+                index, row, clip, attempt, download = candidate
+                result = Future()
+                try:
+                    video = download.result() if download is not None else download_candidate(clip, args, row)
+                    if aligner is None:
+                        result.set_result(({"video": str(video.resolve())}, video.parent))
+                    elif pool is None:
+                        result.set_result(aligner(clip, video))
+                    else:
+                        result = pool.submit(aligner, clip, video)
+                except Exception as exc:
+                    result.set_exception(exc)
+                    if isinstance(exc, fatal_errors):
+                        halted = True
+                    if isinstance(exc, SourceUnavailableError):
+                        # TalkVid downloads stay on this coordinator; suppress other
+                        # clips from the dead upload before requesting the next row.
+                        report["unavailable_sources"][clip.source_key] = str(exc)
+                pending.append((index, row, clip, attempt, result))
+            if not pending:
+                break
+            yield pending.popleft()
+    finally:
+        # Drain both stages before another train/validation/pretrain pass can start.
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+        downloads.close()
+
+
 def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
     import train
 
     resume_chars = None
+    aligner = None
+    alignment_workers = alignment_worker_count(args, video_only=video_only)
     if not video_only:
         grouper = load_grouper(args.group_frames_code)
         tokenizer, unit, token_state, resume_chars = alignment_tokenizer(args)
@@ -789,24 +1026,25 @@ def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
                   "image_ext": args.image_ext, "jpeg_quality": args.jpeg_quality}
         if args.download_max_frames is not None:
             config["download_max_frames"] = args.download_max_frames
-        config_key = digest(config)[:24]
+        aligner = ClipAligner(args, grouper, tokenizer, unit, config, alignment_workers)
     source = args.hdtf_archive if args.dataset == "hdtf" else args.metadata
     if args.dataset == "shofo":
         source = f"{SHOFO_REPO}@{args.shofo_revision}"
     report = {"dataset": args.dataset, "metadata": source, "requested": args.num_videos,
+              "download_workers": args.download_workers if args.dataset in ("hdtf", "shofo") else 1,
+              "alignment_workers": alignment_workers,
+              "attempts": 0,
               "download_max_frames": args.download_max_frames,
               "manifest": str(args.manifest), "results": [], "failures": [],
               "unavailable_sources": {}, "skipped_unavailable_clips": 0,
               "skipped_excluded_clips": 0}
     report_path = args.work_dir / ("pretrain_report.json" if video_only else
                                    "validation_report.json" if validation else "run_report.json")
-    records, seen = [], set()
+    records = []
     excluded = set()
     for manifest_path in (args.exclude_manifest, args.validation_manifest, *exclude_manifests):
         if manifest_path:
             excluded.update(train.video_identity_keys(train.load_manifest(manifest_path, video_only=True)))
-    attempts = 0
-    whisper = None
     languages = {value.casefold() for value in args.dataset_language}
     if args.dataset in ("hdtf", "shofo") and "en" in languages:
         languages.add("english")
@@ -814,87 +1052,16 @@ def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
     partial = args.manifest.with_name(args.manifest.name + ".partial")
     print(f"Reading {args.dataset} source: {source}", flush=True)
     try:
-        candidates = (iter_hdtf(args) if args.dataset == "hdtf" else
-                      iter_shofo(args) if args.dataset == "shofo" else iter_metadata(args.metadata))
+        candidates = prepared_clips(args, report, records, excluded, languages, aligner)
         with partial.open("w", encoding="utf-8") as jsonl, contextlib.closing(candidates) as rows:
-            for index, row in enumerate(rows):
-                if index < args.start_index:
-                    continue
-                if not isinstance(row, dict):
-                    continue
-                info = row.get("info") or {}
-                if languages and (not isinstance(info, dict) or
-                                  str(info.get("Language", "")).casefold() not in languages):
-                    continue
-                try:
-                    clip = Clip.from_row(row) if args.dataset == "talkvid" else row["clip"]
-                except (TypeError, ValueError, AttributeError) as exc:
-                    report["failures"].append({"index": index, "error": f"Invalid metadata: {exc}"})
-                    continue
-                if clip.key in seen:
-                    continue
-                seen.add(clip.key)
-                candidate_keys = {("source", clip.source_key),
-                                  ("path", str((download_folder(clip, args) / "video.mp4").resolve()))}
-                if candidate_keys & excluded:
-                    report["skipped_excluded_clips"] += 1
-                    continue
-                if (clip.source_key in report["unavailable_sources"] and
-                        cached_download(clip, args) is None):
-                    report["skipped_unavailable_clips"] += 1
-                    continue
-                attempts += 1
+            for index, row, clip, attempt, future in rows:
                 description = (clip.member if isinstance(clip, ArchiveClip) else
                                clip.filename if isinstance(clip, ShofoClip) else
                                f"{clip.url} [{clip.start:.3f}, {clip.end:.3f}]")
-                print(f"[{len(records)}/{args.num_videos} usable; attempt {attempts}/{args.max_attempts}] "
+                print(f"[{len(records)}/{args.num_videos} usable; attempt {attempt}/{args.max_attempts}] "
                       + description, flush=True)
                 try:
-                    if args.dataset == "hdtf":
-                        video = download_hdtf_clip(clip, args, row["archive"], row["member"])
-                    elif args.dataset == "shofo":
-                        video = download_shofo_clip(clip, args)
-                    else:
-                        video = download_clip(clip, args)
-                    if video_only:
-                        output = video.parent
-                        record = {"video": str(video.resolve())}
-                    else:
-                        output = args.work_dir / "frames" / clip.key / config_key
-                        completed = output / "complete.json"
-                        signature = video_signature(video)
-                        cached = None
-                        if not args.reprocess and completed.exists():
-                            cached = read_cache(completed)
-                        manifest = read_cache(output / "manifest.json")
-                        if cached and cached.get("video_signature") == signature and manifest:
-                            print(f"  Reusing alignment: {output}", flush=True)
-                        else:
-                            if whisper is None:
-                                try:
-                                    whisper = grouper.WhisperModel(
-                                        args.whisper_model, device=args.whisper_device,
-                                        compute_type=args.whisper_compute_type,
-                                    )
-                                except Exception as exc:
-                                    # A model/device setup error affects every clip;
-                                    # do not keep downloading replacement candidates.
-                                    raise WhisperSetupError(f"Cannot initialize Whisper: {exc}") from exc
-                            # An interrupted/reprocessed run must not leave obsolete
-                            # token folders beside a new alignment.
-                            if output.exists():
-                                shutil.rmtree(output)
-                            print(f"  Transcribing and grouping frames: {video}", flush=True)
-                            manifest = grouper.group_frames_by_token(
-                                video, tokenizer, output, whisper_model=args.whisper_model,
-                                language=args.language, device=args.whisper_device,
-                                compute_type=args.whisper_compute_type, image_ext=args.image_ext,
-                                jpeg_quality=args.jpeg_quality, whisper_instance=whisper,
-                            )
-                        record = training_record(manifest, tokenizer, unit, video)
-                        record["source_key"] = clip.source_key
-                        grouper.write_jsonl([record], output / "data.jsonl")
-                        write_json(completed, {"video_signature": signature, "config": config})
+                    record, output = future.result()
                     record["source_key"] = clip.source_key
                     jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
                     jsonl.flush()
@@ -905,18 +1072,16 @@ def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
                           f"  Ready: {len(record['windows'])} aligned tokens", flush=True)
                 except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
                     report["failures"].append({"index": index, "clip": clip.__dict__, "error": str(exc)})
-                    if isinstance(exc, (WhisperSetupError, DownloadSetupError, ArchiveAccessError, ShofoAccessError)):
+                    if isinstance(exc, (AlignmentSetupError, DownloadSetupError, ArchiveAccessError, ShofoAccessError)):
                         raise
                     if isinstance(exc, SourceUnavailableError):
                         report["unavailable_sources"][clip.source_key] = str(exc)
                         print("  Source unavailable; skipping its remaining clips this run", flush=True)
                     print(f"  Skipping clip: {exc}", file=sys.stderr, flush=True)
                 write_json(report_path, report)
-                if len(records) == args.num_videos or attempts >= args.max_attempts:
-                    break
         if len(records) != args.num_videos:
             raise RuntimeError(
-                f"Only {len(records)}/{args.num_videos} usable clips after {attempts} attempts. "
+                f"Only {len(records)}/{args.num_videos} usable clips after {report['attempts']} attempts. "
                 f"Training was not started. See {report_path}; partial data: {partial}. "
                 "Increase --max-attempts or change the dataset/source/filter. Completed clips are cached."
             )
@@ -929,11 +1094,14 @@ def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
         print(f"Prepared {len(records)} clips: {args.manifest}", flush=True)
     finally:
         report["usable"] = len(records)
-        report["attempts"] = attempts
         write_json(report_path, report)
 
 
-class WhisperSetupError(RuntimeError):
+class AlignmentSetupError(RuntimeError):
+    pass
+
+
+class WhisperSetupError(AlignmentSetupError):
     pass
 
 

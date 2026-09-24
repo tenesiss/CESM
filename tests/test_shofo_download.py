@@ -3,15 +3,14 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import unittest
 from dataclasses import replace
-from http.client import IncompleteRead
 from types import SimpleNamespace
-from urllib.error import HTTPError
-from urllib.request import Request
-from unittest.mock import Mock, patch
+from pathlib import Path
+from unittest.mock import patch
 
 import huggingface_hub
 
@@ -21,10 +20,10 @@ import train_downvid as pipeline
 from tests.test_train_downvid import PipelineFixture
 
 
-def response(payload):
-    stream = io.BytesIO(payload)
-    stream.status = 200
-    return stream
+def hub_error(status):
+    error = RuntimeError("signed URL with test-secret")
+    error.response = SimpleNamespace(status_code=status)
+    return error
 
 
 class ShofoAccessTests(PipelineFixture):
@@ -76,53 +75,97 @@ class ShofoAccessTests(PipelineFixture):
                     self.assertRaises(shofo.ShofoAccessError):
                 list(shofo.iter_shofo(self.args()))
 
-    def test_download_auth_pinned_url_and_retry_replaces_partial_bytes(self):
-        opener = Mock()
-        interrupted = response(b"bad")
-        opener.open.side_effect = [interrupted, response(b"video")]
+    def test_download_uses_hub_auth_pinned_commit_and_local_staging(self):
         output = self.root / "source.mp4"
-        with patch.object(shofo, "build_opener", return_value=opener), patch.object(shofo.time, "sleep"):
+        source = self.root / "hub" / self.clip.filename
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"video")
+        with patch.object(huggingface_hub, "hf_hub_download", return_value=str(source)) as download:
+            shofo.hub_download(self.clip, output)
+        self.assertEqual(output.read_bytes(), b"video")
+        download.assert_called_once_with(
+            shofo.SHOFO_REPO, self.clip.filename, repo_type="dataset", revision=self.clip.revision,
+            token="test-secret", local_dir=self.root / "hub", force_download=False,
+        )
+
+    def test_retry_rejects_wrong_size_and_replaces_partial_bytes(self):
+        output = self.root / "source.mp4"
+        source = self.root / "hub" / self.clip.filename
+        source.parent.mkdir(parents=True)
+        payloads = iter([b"bad", b"video"])
+
+        def download(*args, **kwargs):
+            source.write_bytes(next(payloads))
+            return str(source)
+
+        with patch.object(huggingface_hub, "hf_hub_download", side_effect=download) as transfer, \
+                patch.object(shofo, "run_hub_download", side_effect=lambda clip, output, timeout, **kw:
+                             shofo.hub_download_result(clip, output, **kw)), \
+                patch.object(shofo.time, "sleep"):
             shofo.copy_shofo_video(self.clip, output, 30, 1)
         self.assertEqual(output.read_bytes(), b"video")
-        self.assertEqual(opener.open.call_count, 2)
-        request = opener.open.call_args.args[0]
-        self.assertIn(f"/resolve/{self.clip.revision}/{self.clip.filename}", request.full_url)
-        self.assertEqual(request.get_header("Authorization"), "Bearer test-secret")
-
-    def test_redirect_keeps_token_on_same_origin_only(self):
-        handler = shofo.HubRedirectHandler()
-        request = Request("https://huggingface.co/start", headers={"Authorization": "Bearer test-secret"})
-        for target, expected in (("https://huggingface.co/end", "Bearer test-secret"),
-                                 ("https://cdn.example/video?signature=secret", None),
-                                 ("http://huggingface.co/end", None)):
-            redirected = handler.redirect_request(request, None, 302, "Found", {}, target)
-            self.assertEqual(redirected.get_header("Authorization"), expected)
+        self.assertEqual(transfer.call_count, 2)
+        self.assertTrue(transfer.call_args.kwargs["force_download"])
 
     def test_transfer_errors_do_not_expose_credentials(self):
         for status, exception in ((401, shofo.ShofoAccessError), (403, shofo.ShofoAccessError),
                                    (404, OSError)):
-            opener = Mock()
-            opener.open.side_effect = HTTPError("https://cdn.example?test-secret", status,
-                                                 "test-secret", {}, None)
-            with self.subTest(status=status), patch.object(shofo, "build_opener", return_value=opener):
+            with self.subTest(status=status), \
+                    patch.object(huggingface_hub, "hf_hub_download", side_effect=hub_error(status)) as transfer, \
+                    patch.object(shofo, "run_hub_download", side_effect=lambda clip, output, timeout, **kw:
+                                 shofo.hub_download_result(clip, output, **kw)):
                 with self.assertRaises(exception) as caught:
                     shofo.copy_shofo_video(self.clip, self.root / "source.mp4", 30, 3)
-                self.assertEqual(opener.open.call_count, 1)
+                self.assertEqual(transfer.call_count, 1)
                 self.assertNotIn("test-secret", str(caught.exception))
 
-    def test_retry_http_and_interrupted_read_and_deadline(self):
-        interrupted = response(b"")
-        interrupted.read1 = Mock(side_effect=IncompleteRead(b"partial", 5))
-        opener = Mock()
-        opener.open.side_effect = [HTTPError("https://example.test", 503, "retry", {}, None),
-                                   interrupted, response(b"video")]
-        with patch.object(shofo, "build_opener", return_value=opener), patch.object(shofo.time, "sleep"):
-            shofo.copy_shofo_video(self.clip, self.root / "source.mp4", 30, 2)
-        self.assertEqual(opener.open.call_count, 3)
-        with patch.object(shofo, "build_opener", return_value=opener), \
-                patch.object(shofo.time, "monotonic", side_effect=[0, 31]):
+    def test_retry_transient_errors_and_total_deadline(self):
+        output = self.root / "source.mp4"
+        output.write_bytes(b"video")
+        with patch.object(shofo, "run_hub_download", side_effect=[
+            {"ok": False, "status": 503, "error": "HfHubHTTPError"},
+            {"ok": False, "status": None, "error": "RuntimeError"},
+            {"ok": True},
+        ]) as transfer, patch.object(shofo.time, "sleep"), \
+                patch.object(shofo.time, "monotonic", side_effect=[0, 1, 2, 3, 4, 5]):
+            shofo.copy_shofo_video(self.clip, output, 30, 2)
+        self.assertEqual([call.args[2] for call in transfer.call_args_list], [29, 27, 25])
+        self.assertTrue(all(not call.kwargs["force_download"] for call in transfer.call_args_list))
+        with patch.object(shofo.time, "monotonic", side_effect=[0, 31]), \
+                patch.object(shofo, "run_hub_download") as transfer:
             with self.assertRaises(TimeoutError):
-                shofo.copy_shofo_video(self.clip, self.root / "source.mp4", 30, 3)
+                shofo.copy_shofo_video(self.clip, output, 30, 3)
+            transfer.assert_not_called()
+
+    def test_real_hub_subprocess_and_timeout_cleanup(self):
+        # A local stand-in exercises the actual child process without Hub access.
+        stub = self.root / "huggingface_hub.py"
+        stub.write_text("from pathlib import Path\n"
+                        "def get_token(): return 'test-secret'\n"
+                        "def hf_hub_download(repo, filename, **kw):\n"
+                        "    print('transfer diagnostic')\n"
+                        "    p = Path(kw['local_dir']) / filename\n"
+                        "    p.parent.mkdir(parents=True, exist_ok=True)\n"
+                        "    p.write_bytes(b'video')\n"
+                        "    return str(p)\n")
+        output = self.root / "source.mp4"
+        with patch.dict(os.environ, {"PYTHONPATH": str(self.root)}):
+            shofo.copy_shofo_video(self.clip, output, 10, 0)
+            self.assertEqual(output.read_bytes(), b"video")
+            stub.write_text("import time\ntime.sleep(30)\n")
+            processes = []
+            popen = subprocess.Popen
+
+            def start(*args, **kwargs):
+                process = popen(*args, **kwargs)
+                processes.append(process)
+                return process
+
+            with patch.object(subprocess, "Popen", side_effect=start), \
+                    self.assertRaisesRegex(TimeoutError, "timed out"):
+                shofo.copy_shofo_video(self.clip, output, .3, 3)
+            self.assertEqual(len(processes), 1)
+            self.assertIsNotNone(processes[0].poll())
 
     def test_cli_requires_only_hosted_dependencies(self):
         parser = pipeline.build_argparser()
@@ -162,10 +205,15 @@ class ShofoPipelineTests(PipelineFixture):
         ])
         self.enterContext(patch.object(huggingface_hub.HfApi, "dataset_info", return_value=info))
         self.enterContext(patch.object(huggingface_hub, "get_token", return_value="test-secret"))
-        self.opener = Mock()
-        self.opener.open.side_effect = lambda request, **kw: response(
-            self.payloads[request.full_url.split(f"/resolve/{info.sha}/")[1]])
-        self.enterContext(patch.object(shofo, "build_opener", return_value=self.opener))
+        def download(repo, filename, **kwargs):
+            source = Path(kwargs["local_dir"]) / filename
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(self.payloads[filename])
+            return str(source)
+
+        self.transfer = self.enterContext(patch.object(huggingface_hub, "hf_hub_download", side_effect=download))
+        self.enterContext(patch.object(shofo, "run_hub_download", side_effect=lambda clip, output, timeout, **kw:
+                                      shofo.hub_download_result(clip, output, **kw)))
         self.enterContext(patch.object(pipeline, "download_clip", side_effect=AssertionError("YouTube called")))
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.enterContext(contextlib.redirect_stderr(io.StringIO()))
@@ -179,9 +227,9 @@ class ShofoPipelineTests(PipelineFixture):
         for limit, expected in ((None, 50), (12, 12), (1, 1), (100, 50)):
             args = self.shofo_args(*([] if limit is None else ["--download-max-frames", str(limit)]))
             video = pipeline.download_shofo_clip(clip, args)
-            calls = self.opener.open.call_count
+            calls = self.transfer.call_count
             self.assertEqual(pipeline.download_shofo_clip(clip, args), video)
-            self.assertEqual(self.opener.open.call_count, calls)
+            self.assertEqual(self.transfer.call_count, calls)
             result = subprocess.run([
                 "ffprobe", "-v", "error", "-count_frames", "-show_streams", "-of", "json", str(video),
             ], check=True, capture_output=True, text=True, timeout=30)
@@ -233,12 +281,12 @@ class ShofoPipelineTests(PipelineFixture):
         self.assertEqual(len(train.load_manifest(str(args.manifest) + ".partial", video_only=True)), 1)
 
     def test_access_failure_stops_without_caching_or_replacing_manifest(self):
-        args = self.shofo_args("-N", "2", "--start-index", "1")
+        args = self.shofo_args("-N", "2", "--start-index", "1", "--download-workers", "1")
         args.manifest.write_text("previous manifest\n")
-        self.opener.open.side_effect = HTTPError("https://example.test?test-secret", 403, "denied", {}, None)
+        self.transfer.side_effect = hub_error(403)
         with self.assertRaises(shofo.ShofoAccessError):
             pipeline.prepare(args, video_only=True)
-        self.assertEqual(self.opener.open.call_count, 1)
+        self.assertEqual(self.transfer.call_count, 1)
         self.assertEqual(args.manifest.read_text(), "previous manifest\n")
         report = pipeline.read_cache(self.root / "pretrain_report.json")
         self.assertEqual((report["usable"], report["attempts"]), (0, 1))

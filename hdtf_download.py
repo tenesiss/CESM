@@ -27,10 +27,11 @@ class ArchiveAccessError(RuntimeError):
 class HTTPRangeReader(io.RawIOBase):
     """Seekable ZIP input that never falls back to downloading the whole archive."""
 
-    def __init__(self, url, timeout, retries):
+    def __init__(self, url, timeout, retries, *, identity=None):
         super().__init__()
         self.url, self.timeout, self.retries = url, timeout, retries
-        self.position, self.size, self.etag = 0, None, None
+        self.position = 0
+        self.size, self.etag = identity or (None, None)
         self.deadline = time.monotonic() + timeout
         self._fetch(0, 0)
 
@@ -111,10 +112,10 @@ class HTTPRangeReader(io.RawIOBase):
 
 
 @contextlib.contextmanager
-def open_archive(source, timeout, retries):
+def open_archive(source, timeout, retries, *, identity=None):
     with contextlib.ExitStack() as stack:
         if urlparse(source).scheme in ("http", "https"):
-            stream = stack.enter_context(HTTPRangeReader(source, timeout, retries))
+            stream = stack.enter_context(HTTPRangeReader(source, timeout, retries, identity=identity))
         else:
             stream = stack.enter_context(Path(source).expanduser().open("rb"))
         try:

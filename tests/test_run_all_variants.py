@@ -60,6 +60,18 @@ class AllVariantRunnerTests(unittest.TestCase):
             self.assertEqual(evaluate[evaluate.index("--device") + 1], "auto")
             self.assertNotIn("--max-frames", evaluate)  # Read each checkpoint's own section size.
 
+    def test_download_workers_forwarded_to_each_preparation_stage(self):
+        _, _, _, stages = self.plan(["--dataset", "shofo", "-N", "3", "--N-valid", "2",
+                                     "--N-pretrain", "4", "--download-workers", "2",
+                                     "--alignment-workers", "3", "--sequential-alignment"])
+        preparations = [stage for stage in stages if stage["name"].startswith("download")]
+        self.assertEqual(len(preparations), 3)
+        for stage in preparations:
+            args = train_downvid.build_argparser().parse_args(stage["command"][2:])
+            self.assertEqual(args.download_workers, 2)
+            self.assertEqual(args.alignment_workers, 3)
+            self.assertTrue(args.sequential_alignment)
+
     def test_selected_variants_train_and_evaluate_once_in_numeric_order(self):
         for source in (["-N", "3"], ["--manifest", "existing.jsonl"]):
             for selection, expected in (([5], [5]), ([5, 2, 5], [2, 5])):

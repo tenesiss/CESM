@@ -792,6 +792,9 @@ The downloader verifies each ZIP member CRC and the video/audio streams. Failed
 media or alignment candidates are replaced until N are usable. Archive access
 errors stop the run; servers that ignore byte ranges require a local archive.
 Reruns reuse completed videos and alignments, but still read the archive index.
+Concurrent transfers use independent archive readers and check the archive
+identity and selected member metadata against the initial listing. HDTF uses
+selective HTTP ranges; it does not use the `hf_xet` client or fetch the whole ZIP.
 
 ### Shofo: hosted English talking-head videos
 
@@ -822,6 +825,15 @@ defaults to `main`; each preparation pass resolves it to a commit and pins its
 downloads to that version. Use a commit hash to reproduce selection across runs.
 Completed videos and alignments are cached under `data/shofo` by default.
 
+MP4 transfers use `huggingface_hub.hf_hub_download`, with automatic `hf_xet`
+acceleration when available and enabled. The Hub version in
+`requirements-downvid.txt` installs `hf_xet` on supported platforms. Downloads
+use a temporary local Hub directory inside the clip's staging directory, so
+full originals are not also retained in the global Hugging Face file cache.
+The Hub manages authentication, redirects, and partial-transfer resumption
+between retries. Each transfer runs in a child process so `--download-timeout`
+can stop a stalled HTTP or native Xet transfer, including its retry time.
+
 `--start-index`, `--max-attempts`, `--download-timeout`, `--download-retries`,
 `--N-pretrain`, and training options work as with the other sources. English
 and `en` are the only accepted `--dataset-language` filters. Each selected MP4
@@ -832,10 +844,59 @@ Whisper generates the training alignments; Shofo's supplied transcripts are
 not used. Pretraining-only preparation skips Whisper and alignment.
 
 Invalid media and alignment failures are replaced until N clips are usable.
-Authentication/access failures stop immediately with setup instructions.
+Authentication/access failures stop preparation with setup instructions.
 Source IDs remain stable across revisions and frame caps, allowing validation
 downloads to exclude training/pretraining videos. Tokens are not written to
 clip caches, manifests, or run reports.
+
+### Parallel downloads and alignment
+
+HDTF and Shofo default to `--download-workers 4`. Both `train_downvid.py` and
+`run_all_variants.py` accept this option, including for pretraining and validation
+preparation. Use `--download-workers 1` to disable prefetch. TalkVid continues
+to download sequentially.
+
+Alignment also runs in parallel by default, with `--alignment-workers 4` for
+TalkVid, HDTF, and Shofo. Download and alignment concurrency are independent:
+the download pool fetches, validates, and optionally trims upcoming videos while
+the alignment pool transcribes and groups frames. **`--sequential-alignment`**
+overrides the alignment worker count to one while keeping parallel downloads.
+Use both `--download-workers 1 --sequential-alignment` for fully serial preparation.
+Pretraining-only preparation skips alignment and does not load Whisper.
+
+Alignment workers share one lazily initialized Faster Whisper model configured
+with its supported `num_workers` concurrency, and each thread has its own
+tokenizer copy. More concurrent transcriptions use more RAM/VRAM; reduce
+`--alignment-workers` or use `--sequential-alignment` if needed. Worker counts
+do not change cache keys: completed alignments are reusable between modes.
+
+Manifest and report writes stay sequential. Results retain source order even
+when downloads or alignments finish out of order. Both stages share a bounded
+candidate budget: outstanding work is limited by their worker counts, the number
+of usable clips still needed, and the remaining `--max-attempts` budget. Failed
+media or alignments trigger replacement candidates; `-N` still counts usable clips.
+
+On an error or interruption, queued jobs are canceled and running jobs finish
+before preparation exits; download timeouts still apply to transfers. Completed
+downloads and alignments stay cached for recovery. Reports include effective
+download/alignment worker counts and count scheduled candidates as attempts, including
+in-flight candidates when an error stops the run; the final manifest is replaced
+only after all requested clips are usable.
+
+For Shofo on a fast connection, optional `HF_XET_HIGH_PERFORMANCE=1` enables
+more aggressive Xet transfer settings. Xet already performs concurrent transfers
+within files; tune this alongside `--download-workers` for your bandwidth, CPU,
+and disk. This environment variable does not affect HDTF's HTTP range reader.
+
+```bash
+python3 train_downvid.py --dataset shofo -N 100 \
+  --download-workers 4 --alignment-workers 4 \
+  --download-max-frames 256 --language en --prepare-only
+
+# Keep downloads parallel and align one clip at a time:
+python3 train_downvid.py --dataset hdtf -N 100 \
+  --sequential-alignment --language en --prepare-only
+```
 
 ### Downloader runtime (TalkVid only)
 
@@ -879,6 +940,9 @@ to select a runtime outside PATH. Authentication can be supplied using
 | `--download-format SELECTOR` | yt-dlp format selection; must retain both audio and video. |
 | `--download-max-frames N` | Keep at most the first N frames of each clip and trim audio to match; default: full clip. |
 | `--download-timeout 600` / `--download-retries 3` | Per-clip timeout in seconds and downloader retries. |
+| `--download-workers 4` | Concurrent HDTF/Shofo downloads; `1` disables download prefetch. TalkVid downloads remain sequential. |
+| `--alignment-workers 4` | Concurrent transcription/frame-alignment jobs, capped by the requested clip count; uses more RAM/VRAM. |
+| `--sequential-alignment` | Force one alignment worker, overriding `--alignment-workers`; downloads can still run in parallel. |
 | `--image-ext jpg` / `--jpeg-quality 95` | Settings for the grouper's saved frame images. |
 | `--reprocess` | Recompute frame alignments while reusing completed downloads. |
 

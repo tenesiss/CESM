@@ -142,6 +142,17 @@ python3 run_all_variants.py --dataset shofo -N 100 --N-valid 20 \
 in full and optionally trimmed locally; Hugging Face access failures stop the
 run. See the [Shofo setup instructions](../README.md#shofo-hosted-english-talking-head-videos).
 
+HDTF and Shofo default to four concurrent downloads. Set `--download-workers N`
+to tune download concurrency. All sources also default to `--alignment-workers 4`
+for parallel transcription and frame grouping. Use `--sequential-alignment` to
+force one alignment worker while keeping parallel downloads, or add
+`--download-workers 1` for fully serial preparation. The stages overlap while
+retaining source order and exact usable sample counts. These options are forwarded
+to all preparation stages; pretraining preparation skips alignment. Shofo uses
+the Hugging Face Hub's Xet-capable downloader; HDTF keeps selective HTTP ZIP ranges
+with independent readers. Alignment workers share a model configured for concurrent
+transcriptions; higher alignment worker counts use more RAM/VRAM.
+
 Install FFmpeg (`ffmpeg` and `ffprobe`); only TalkVid requires a supported
 yt-dlp JavaScript runtime, as described in the repository README. All TalkVid download/alignment options
 are available, including repeated `--dataset-language`, `--metadata`,
