@@ -441,8 +441,10 @@ evaluation computes $d_f$ once for both outputs. The token branch does
 not pass through the confidence branch's causal self-attention or FFN.
 
 Frames inside real-token windows receive training labels; gaps, padding,
-and \EOS{} do not receive frame labels. Window phasing changes these
-labels without adding or rearranging any model block~\cite{training}.
+and \EOS{} do not receive frame labels. Window phasing adds a previous-token
+loss on selected frames, using the same blocks with a stricter text mask that
+excludes that previous token and all later text. Encoder outputs and projected
+queries, keys, and values are shared between the two paths~\cite{training}.
 
 \section{Confidence branch in every variant}
 \label{sec:confidence}

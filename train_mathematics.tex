@@ -428,20 +428,31 @@ has no previous-token target; $\BOS$ is never added as a phased label.
 For example, $\varphi=0.1$ and $L_{bi}=20$ phase offsets $0$ and $1$.
 At this fraction a window shorter than ten frames has no phased frames.
 
+The previous-token term uses a separate distribution
+$p_{bif}^{\mathrm{prev}}$: reuse the same encoded video through frame $f$,
+but restrict video-to-text attention to $\BOS,y_{b1},\ldots,y_{b,i-2}$.
+The usual $p_{bf}^{\mathrm{fr}}$ can attend through $y_{b,i-1}$.
+Excluding the previous target and all states that encode it prevents the
+auxiliary term from learning to copy an already visible teacher token.
+The causal text encoder makes earlier states reusable under either mask.
+
 For $f\in\mathcal W_{bi}$, the per-frame cross entropy is
 \begin{equation}
 \mathcal C_{bif}^{(\varphi)}=
 \begin{cases}
 -\tfrac12\log p_{bf}^{\mathrm{fr}}(y_{bi})
--\tfrac12\log p_{bf}^{\mathrm{fr}}(y_{b,i-1}),&f\in\mathcal P_{bi},\\
+-\tfrac12\log p_{bif}^{\mathrm{prev}}(y_{b,i-1}),&f\in\mathcal P_{bi},\\
 -\log p_{bf}^{\mathrm{fr}}(y_{bi}),&f\notin\mathcal P_{bi}.
 \end{cases}
 \label{eq:phased-frame-ce}
 \end{equation}
-This is cross entropy against a target assigning equal probability to
-the current and previous tokens on phased frames. If those token IDs
-are equal, their weights combine to one and the loss is ordinary
-single-target cross entropy.
+This averages two cross entropies with different conditioning prefixes;
+it is not a soft target applied to one distribution. Equal consecutive
+token IDs still require both terms because their text contexts differ.
+The implementation shares encoder outputs and attention Q/K/V projections,
+evaluates the extra attention and token head only on phased frames, and
+checkpoints chunks of at most 128 frames through cross entropy. This bounds
+the extra vocabulary activations without rerunning either encoder.
 
 Let $i(b,f)$ identify the original token window containing a valid
 frame. The first-stage prediction objective becomes
@@ -458,8 +469,9 @@ denominator mass. At $\varphi=0$, this reduces to
 \eqref{eq:frame-ce}; at $\varphi=1$, every frame of each window after
 the first uses both labels. Token-query objectives are unaffected.
 
-Phasing changes supervision without shifting alignment boundaries or
-teacher-token availability in \eqref{eq:v2t}. Stage~II retains the same
+Phasing does not shift alignment boundaries or the current-token path's
+teacher-token availability in \eqref{eq:v2t}; only the auxiliary path
+removes the latest available text state. Stage~II retains the same
 confidence windows and target construction, using the predictor learned
 with the chosen phasing fraction. Evaluation continues to score the
 current token $y_{bi}$ at each labeled frame.

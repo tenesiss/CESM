@@ -567,13 +567,24 @@ For a window of `L` frames, the last phased zero-based offset is
 offsets 0 and 1; a window shorter than 10 frames has no phased frames.
 Each phased frame contributes `0.5 * CE(current) + 0.5 * CE(previous)`.
 The batch loss still averages over valid frames, so a phased frame counts once.
-Repeated consecutive token IDs have the same loss as a single target.
+The two terms use different causal text contexts: the current-token prediction
+can see text through the previous token, while the previous-token prediction
+can see only text before that previous token. Both use video through the current
+frame. This prevents the previous-token loss from rewarding copying its target
+from the teacher prefix. Repeated consecutive token IDs still use the two
+different contexts.
+
+Both paths share encoded video/text and attention Q/K/V projections. Only
+phased frames run the extra attention and token head, in chunks of at most 128
+frames. Those chunks are checkpointed through cross entropy during training,
+so the extra path does not retain a full frame-by-vocabulary logits tensor.
 
 The first token window has no previous target. Gaps and padding remain ignored.
 Phasing uses the full original token window, including across `--max-frames`
-boundaries; it never restarts at a section cut. Teacher-token availability and
-confidence windows retain their existing boundaries. Evaluation CSVs continue
-to score the current token, making them comparable across phasing settings.
+boundaries; it never restarts at a section cut. The current-token path's teacher
+availability and confidence windows retain their existing boundaries.
+Evaluation CSVs continue to score the current token, making them comparable
+across phasing settings.
 
 ```bash
 python3 tests/train_5_frame_tokens.py --manifest data/train.jsonl --window-phasing 0.1

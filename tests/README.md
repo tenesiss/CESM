@@ -47,8 +47,12 @@ after the first, the frame loss is `0.5 * CE(current) + 0.5 * CE(previous)`.
 Equivalently, the last phased zero-based offset is
 `floor(FRACTION * original_window_length) - 1`. Each frame still counts once
 in the batch mean. Phasing never restarts at a section boundary and never labels
-gaps or padding. Repeated tokens reduce to ordinary CE. Metrics keep scoring
-the current token; confidence windows and causal teacher timing stay the same.
+gaps or padding. Current-token CE sees text through the previous token;
+previous-token CE excludes that token and all later text. Repeated token IDs
+still use these distinct contexts. The extra path shares encoder outputs and
+Q/K/V projections, and checkpoints attention/head/CE in chunks of at most 128
+phased frames. Metrics keep scoring the current token; confidence windows and
+the current path's causal teacher timing stay the same.
 The checkpoint records the fraction; pass it again on resume to retain it.
 
 Projection losses retain their defaults. `--lambda-tcross`, `--lambda-mono`, and

@@ -1588,11 +1588,19 @@ class MixedBlock(nn.Module):
     def forward_frame(self, x_video, x_text, video_to_text_allowed) -> dict:
         hv0 = self.vproj(x_video)
         ht0 = self.project_text(x_text)
-        vcross, _ = self.video_cross(hv0, ht0, allowed=video_to_text_allowed)
+        attention = self.video_cross
+        q = attention._split(attention.q_proj(hv0))
+        k, v = attention.project_kv(ht0)
+        vcross, _ = attention._attend(q, k, v, allowed=video_to_text_allowed)
         return {
             "token_logits": self.frame_logits(hv0, vcross),
             "video_projected": hv0,
             "text_projected": ht0,
+            # Reuse these tensors for phased targets without another encoder
+            # or Q/K/V projection pass. No extra tensor storage is allocated.
+            "frame_q": q,
+            "frame_k": k,
+            "frame_v": v,
         }
 
     def project_text(self, x_text: torch.Tensor) -> torch.Tensor:
@@ -2534,49 +2542,92 @@ def token_cross_entropy(
     logits: torch.Tensor,
     targets: torch.Tensor,
     pad_id: int,
-    previous_targets: Optional[torch.Tensor] = None,
+    position_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Mean over valid positions, with equal current/previous CE during phasing.
+    """Weighted CE divided by the number of valid positions, not weight mass.
 
-    Keep targets sparse and bound AMP's FP32 vocabulary intermediates. A phased
-    frame still counts once in the denominator, including repeated token IDs.
+    Keep targets sparse and bound AMP's FP32 vocabulary intermediates. Phasing
+    gives current targets half weight; the separately masked loss adds the rest.
     """
     logits = logits.reshape(-1, logits.shape[-1])
     targets = targets.reshape(-1)
-    if previous_targets is not None:
-        previous_targets = previous_targets.reshape(-1)
+    if position_weights is not None:
+        position_weights = position_weights.reshape(-1)
     count = (targets != pad_id).sum()
     if not count:
         return logits[:0].sum()  # Differentiable zero without summing huge logits.
     chunked = torch.is_autocast_enabled(logits.device.type) and logits.shape[0] > 128
-    if not chunked and previous_targets is None:
+    if not chunked and position_weights is None:
         return F.cross_entropy(logits, targets, ignore_index=pad_id)
 
-    def chunk_loss(values, labels, previous):
-        if previous is None:
+    def chunk_loss(values, labels, weights):
+        if weights is None:
             return F.cross_entropy(values, labels, ignore_index=pad_id, reduction="sum")
-        # One log-softmax for both sparse labels; no dense [B,F,V] targets.
         dtype = torch.float32 if values.dtype in (torch.float16, torch.bfloat16) else values.dtype
         log_probs = F.log_softmax(values, dim=-1, dtype=dtype)
-        current_loss = F.nll_loss(log_probs, labels, ignore_index=pad_id, reduction="none")
-        previous = previous.masked_fill(labels == pad_id, pad_id)
-        previous_loss = F.nll_loss(log_probs, previous, ignore_index=pad_id, reduction="none")
-        return torch.where(previous != pad_id, 0.5 * (current_loss + previous_loss), current_loss).sum()
+        loss = F.nll_loss(log_probs, labels, ignore_index=pad_id, reduction="none")
+        return (weights * loss).sum()
 
     if not chunked:
-        return chunk_loss(logits, targets, previous_targets) / count
+        return chunk_loss(logits, targets, position_weights) / count
 
     losses = []
     for start in range(0, logits.shape[0], 128):
         values, labels = logits[start:start + 128], targets[start:start + 128]
-        previous = None if previous_targets is None else previous_targets[start:start + 128]
+        weights = None if position_weights is None else position_weights[start:start + 128]
         if torch.is_grad_enabled() and values.requires_grad:
             # Otherwise autograd retains all chunks' FP32 log-softmax outputs.
-            loss = checkpoint(chunk_loss, values, labels, previous, use_reentrant=False)
+            loss = checkpoint(chunk_loss, values, labels, weights, use_reentrant=False)
         else:
-            loss = chunk_loss(values, labels, previous)
+            loss = chunk_loss(values, labels, weights)
         losses.append(loss)
     return torch.stack(losses).sum() / count
+
+
+def previous_frame_cross_entropy(
+    model: UnnobaModel, batch: dict, out: dict, pad_id: int,
+) -> torch.Tensor:
+    """Sum previous-target CE using text strictly before the previous token.
+
+    Only phased frames run the extra attention/head, reusing encoded features
+    and projected Q/K/V. Checkpoint each small chunk through CE so backward
+    never retains a second full frame-by-vocabulary tensor (even without AMP).
+    """
+    previous = batch["frame_previous_targets"]
+    phased = (previous != pad_id) & (batch["frame_targets"] != pad_id)
+    mixed = model.mixed
+
+    def chunk_loss(video, q, k, v, allowed, labels):
+        vcross, _ = mixed.video_cross._attend(q, k, v, allowed=allowed)
+        logits = mixed.frame_logits(video, vcross).squeeze(0)
+        dtype = torch.float32 if logits.dtype in (torch.float16, torch.bfloat16) else logits.dtype
+        return F.cross_entropy(logits.to(dtype), labels, reduction="sum")
+
+    losses = []
+    for bi in range(phased.shape[0]):
+        frames = phased[bi].nonzero(as_tuple=True)[0]
+        if not frames.numel():
+            continue
+        length = int(batch["text_lengths"][bi])
+        keys = torch.arange(length, device=frames.device)
+        available = batch["text_available_at"][bi, :length]
+        k = out["frame_k"][bi:bi + 1, :, :length]
+        v = out["frame_v"][bi:bi + 1, :, :length]
+        for indices in frames.split(128):
+            # In a phased frame the latest available teacher state contains
+            # the previous target. Remove that state as well as all later
+            # states, which could also encode it. BOS remains visible.
+            prefix_length = (available[None, :] <= indices[:, None]).sum(-1) - 1
+            allowed = (keys[None, :] < prefix_length[:, None]).unsqueeze(0)
+            video = out["video_projected"][bi:bi + 1].index_select(1, indices)
+            q = out["frame_q"][bi:bi + 1].index_select(2, indices)
+            labels = previous[bi, indices]
+            if torch.is_grad_enabled():
+                loss = checkpoint(chunk_loss, video, q, k, v, allowed, labels, use_reentrant=False)
+            else:
+                loss = chunk_loss(video, q, k, v, allowed, labels)
+            losses.append(loss)
+    return torch.stack(losses).sum() if losses else out["token_logits"].reshape(-1)[:0].sum()
 
 
 def compute_losses(model: UnnobaModel, batch: dict, out: dict, args) -> Dict[str, torch.Tensor]:
@@ -2589,7 +2640,16 @@ def compute_losses(model: UnnobaModel, batch: dict, out: dict, args) -> Dict[str
     query_lengths = query_lengths * active
     amp_enabled = torch.is_autocast_enabled(out["token_logits"].device.type)
     previous_targets = batch.get("frame_previous_targets") if is_frame and args.window_phasing > 0 else None
-    token = token_cross_entropy(out["token_logits"], targets, args.pad_id, previous_targets)
+    phased = None if previous_targets is None else (
+        (previous_targets != args.pad_id) & (targets != args.pad_id)
+    )
+    if phased is not None and phased.any():
+        weights = torch.where(phased, 0.5, 1.0)
+        token = token_cross_entropy(out["token_logits"], targets, args.pad_id, weights)
+        previous_loss = previous_frame_cross_entropy(model, batch, out, args.pad_id)
+        token = token + 0.5 * previous_loss / (targets != args.pad_id).sum()
+    else:
+        token = token_cross_entropy(out["token_logits"], targets, args.pad_id)
     zero = token.new_zeros(())
     vproj = similarity_preservation_loss(
         out["video_encoded"], out["video_projected"], active_video_lengths
@@ -3659,7 +3719,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--vcross-weight", type=float, default=None,
                    help="Fixed vcross multiplier for frame token fusion (default: 1; 0 = video-only token prediction); resume restores the saved weight")
     p.add_argument("--window-phasing", type=float, default=0.0, metavar="FRACTION",
-                   help="Frame fusion only: average current/previous token CE on the first floor(FRACTION * window_length) frames; in [0,1], default 0 (disabled)")
+                   help="Frame fusion only: average current/previous token CE, each with text strictly before its target, on the first floor(FRACTION * window_length) frames; in [0,1], default 0 (disabled)")
 
     # Projection and attention regularizers.
     p.add_argument("--lambda-vproj", type=float, default=0.0)
