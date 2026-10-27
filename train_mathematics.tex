@@ -45,12 +45,14 @@
 \vspace{-2em}
 
 \begin{abstract}
-This document formulates the causal video-to-text model and two-stage
-learning procedure defined in \texttt{train.py}. It describes aligned
-supervision, causal visual and textual representations, multimodal
-prediction, projection and attention regularization, and confidence targets
-derived from a frozen predictor. The presentation is restricted to
-mathematics and algorithmic operations.
+This document formulates the causal video-to-text model and learning
+procedure defined in \texttt{train.py}: optional self-supervised visual
+pretraining followed by two supervised stages. It describes stochastic
+visual views, temporal and augmentation consistency, variance and covariance
+regularization, aligned supervision, causal visual and textual
+representations, multimodal prediction, projection and attention
+regularization, and confidence targets derived from a frozen predictor.
+The presentation focuses on mathematics and algorithmic operations.
 \end{abstract}
 
 The companion architecture document~\cite{architecture} follows the inputs
@@ -274,7 +276,7 @@ Alternatively, $z_j$ is the final hidden state of a pretrained causal
 language model on $(\BOS,y_1,\ldots,y_j)$. This alternative retains
 that model's own internal architecture and positional representation;
 its vocabulary prediction head is not used. Its parameters may be
-fixed or optimized during the first training stage. A fixed text
+fixed or optimized during Stage~I. A fixed text
 encoder is evaluated deterministically.
 
 \section{Multimodal prediction}
@@ -367,6 +369,196 @@ the predicted confidence is
 C_f=\sigma(\kappa_f/\tau_c).
 \end{equation}
 This prediction uses only the visual prefix and causally available text.
+
+\section{Stage 0: optional self-supervised visual pretraining}
+\label{sec:pretraining}
+
+Before Stage~I, the full video encoder can learn from unannotated videos
+using \texttt{--pretrain-visual-encoder} and
+\texttt{--pretrain-manifest}. Text and alignment fields are ignored in
+this stage. The losses act directly on the final $d_v$-dimensional states
+after the temporal layers and output layer normalization, before $P_v$.
+There is no additional projection head. Only the video encoder is
+optimized, including its spatiotemporal front end, spatial encoder,
+temporal layers, and output normalization. The text encoder, modality
+projections, fusion layers, and prediction heads remain fixed.
+
+Restore batch index $b$, let $F_b$ be the number of valid frames in
+batch element $b$, and write $D=d_v$. Define
+\begin{equation}
+\mathcal F=\{(b,f):0\leq f<F_b\},\qquad M=|\mathcal F|.
+\end{equation}
+All valid video frames participate, including those outside any token
+window. Padding is selected out before loss arithmetic. An average over
+an empty eligible set contributes a differentiable zero.
+
+\subsection{Independent augmented views}
+
+For each normalized mouth frame $x_{bf}\in[-1,1]^{3\times H\times W}$,
+two views $x_{bf}^{(1)}$ and $x_{bf}^{(2)}$ are sampled independently.
+Let $u_{bf}=(x_{bf}+1)/2$ and let $\mu_{bf}^{\mathrm{pix}}$ be its
+mean over all color and spatial coordinates. For each view $r\in\{1,2\}$,
+sample independent brightness and contrast factors and an angle:
+\begin{equation}
+B_{bf}^{(r)},K_{bf}^{(r)}\sim\operatorname{Uniform}(0.8,1.2),
+\qquad
+\alpha_{bf}^{(r)}\sim\operatorname{Uniform}(-5^\circ,5^\circ).
+\end{equation}
+The augmented candidate is
+\begin{equation}
+\widetilde x_{bf}^{(r)}
+=2\clip_{[0,1]}\!\left(
+ \mathcal R_{\alpha_{bf}^{(r)}}\!\left[
+ B_{bf}^{(r)}\bigl(K_{bf}^{(r)}(u_{bf}-\mu_{bf}^{\mathrm{pix}})
+                      +\mu_{bf}^{\mathrm{pix}}\bigr)\right]
+\right)-1,
+\label{eq:pretrain-augmentation}
+\end{equation}
+where $\mathcal R_\alpha$ is affine-grid rotation with bilinear
+interpolation, border replication, and unaligned grid corners. Contrast
+is applied about the original frame mean, followed by brightness,
+rotation, clipping, and conversion back to $[-1,1]$.
+
+With retention probability $\pi_0\in[0,1]$, independently sample
+$\delta_{bf}^{(r)}\sim\operatorname{Bernoulli}(\pi_0)$ and set
+\begin{equation}
+x_{bf}^{(r)}=
+\begin{cases}
+x_{bf},&\delta_{bf}^{(r)}=1,\\
+\widetilde x_{bf}^{(r)},&\delta_{bf}^{(r)}=0.
+\end{cases}
+\end{equation}
+The default is $\pi_0=0.2$, controlled by
+\texttt{--pretrain-original-probability}. Choices are independent across
+frames and views, and are resampled at every training step. Padded frames
+are zero in both views and excluded from all reductions. Augmentation
+preserves frame order and length; its pixel operations use FP32 even
+under automatic mixed precision (AMP).
+
+With the same encoder parameters in every pass, define
+\begin{equation}
+v_{bf}^{(r)}=E_v(x_b^{(r)})_f\quad(r=1,2),\qquad
+v_{bf}^{(0)}=E_v(x_b)_f.
+\end{equation}
+The encoder remains in training mode, so each pass also samples its own
+dropout masks. Gradients flow through both augmented passes; neither
+serves as a detached target. The original-video pass $r=0$ is evaluated
+only when the temporal loss has nonzero weight. All representations
+retain the encoder's causal dependence on the corresponding visual
+prefix, even when a loss compares states at different times.
+
+\subsection{Temporal and augmentation consistency}
+
+Let $A\geq2$ be the integer \texttt{--pretrain-adjacent-frames},
+whose default is two. The set of temporal pairs is
+\begin{equation}
+\mathcal E_A
+=\{(b,f,g):0\leq f<g<F_b,\quad g-f<A\}.
+\end{equation}
+Each pair occurs once, within one batch element. Temporal consistency
+uses the original-video representations:
+\begin{equation}
+\mathcal L_{\mathrm{temp}}
+=\frac{1}{|\mathcal E_A|D}
+  \sum_{(b,f,g)\in\mathcal E_A}
+  \norm{v_{bf}^{(0)}-v_{bg}^{(0)}}_2^2.
+\label{eq:pretrain-temporal}
+\end{equation}
+Thus $A=2$ compares consecutive frames only. A single-frame clip
+contributes no pairs. The reduction weights each eligible pair equally,
+rather than averaging clip means.
+
+Augmentation consistency compares the two views at the same frame:
+\begin{equation}
+\mathcal L_{\mathrm{aug}}
+=\frac{1}{MD}\sum_{(b,f)\in\mathcal F}
+  \norm{v_{bf}^{(1)}-v_{bf}^{(2)}}_2^2.
+\label{eq:pretrain-view}
+\end{equation}
+This averages equally over valid frames and feature coordinates.
+Both consistency losses use FP32 arithmetic on selected valid states.
+
+\subsection{Variance floor and covariance regularization}
+
+For each augmented view, stack all valid frames across the batch into
+$Z^{(r)}\in\R^{M\times D}$. For $M\geq2$, define the feature means
+and sample covariance matrix
+\begin{align}
+\mu_j^{(r)}&=\frac1M\sum_{n=1}^{M}Z_{nj}^{(r)},\\
+\Sigma_{jk}^{(r)}&=\frac1{M-1}\sum_{n=1}^{M}
+ (Z_{nj}^{(r)}-\mu_j^{(r)})(Z_{nk}^{(r)}-\mu_k^{(r)}).
+\label{eq:pretrain-statistics}
+\end{align}
+Statistics pool frames across clips; they are neither per-clip
+statistics nor per-frame layer-normalization statistics. Both sample
+variance and covariance use denominator $M-1$.
+
+Let finite $\nu>0$ be \texttt{--pretrain-variance-floor}. Despite its name,
+this is a minimum \emph{standard deviation}, with default $\nu=1$.
+Set $\eps_{\mathrm{var}}=\min\{10^{-4},(0.01\nu)^2\}$ and define
+\begin{align}
+\mathcal V(Z^{(r)})
+ &=\frac1D\sum_{j=1}^{D}
+   \pos{\nu-\sqrt{\Sigma_{jj}^{(r)}+\eps_{\mathrm{var}}}},\\
+\mathcal C(Z^{(r)})
+ &=\frac1D\sum_{\substack{1\leq j,k\leq D\\j\ne k}}
+   (\Sigma_{jk}^{(r)})^2.
+\end{align}
+The covariance sum includes both off-diagonal entries $(j,k)$ and
+$(k,j)$ and divides by $D$, not by the number of entries. Combine the
+views as
+\begin{align}
+\mathcal L_{\mathrm{var}}
+ &=\tfrac12\bigl(\mathcal V(Z^{(1)})+\mathcal V(Z^{(2)})\bigr),\\
+\mathcal L_{\mathrm{cov}}
+ &=\mathcal C(Z^{(1)})+\mathcal C(Z^{(2)}).
+\label{eq:pretrain-diversity}
+\end{align}
+The variance penalties are \emph{averaged} across views, while the
+covariance penalties are \emph{summed}. For $M<2$, both losses are
+differentiable zeros. These statistics and penalties are computed in
+FP32 with autocasting disabled.
+
+Identical constant representations in all passes have zero consistency
+and covariance losses, but incur a positive variance penalty when
+$M\geq2$. The adaptive
+$\eps_{\mathrm{var}}$ keeps that penalty positive even for a small
+chosen $\nu$. Correlated frames, position encodings, and speaker
+appearance can also supply feature variation, so these objectives do
+not themselves guarantee useful transcription features.
+
+\subsection{Combined pretraining objective and defaults}
+
+The VICReg-style objective with optional temporal smoothing is
+\begin{equation}
+\mathcal L_0
+=\lambda_{\mathrm{temp}}\mathcal L_{\mathrm{temp}}
+ +\lambda_{\mathrm{aug}}\mathcal L_{\mathrm{aug}}
+ +\lambda_{\mathrm{var}}\mathcal L_{\mathrm{var}}
+ +\lambda_{\mathrm{cov}}\mathcal L_{\mathrm{cov}}.
+\label{eq:pretrain-total}
+\end{equation}
+The coefficient mapping and defaults are
+\begin{center}
+\begin{tabular}{lll}
+Coefficient & Configuration & Default \\
+\hline
+$\lambda_{\mathrm{temp}}$ & \texttt{--lambda-pretrain-temporal} & $0$ \\
+$\lambda_{\mathrm{aug}}$ & \texttt{--lambda-pretrain-augmentation} & $1$ \\
+$\lambda_{\mathrm{var}}$ & \texttt{--lambda-pretrain-variance} & $1$ \\
+$\lambda_{\mathrm{cov}}$ & \texttt{--lambda-pretrain-covariance} & $0.04$
+\end{tabular}
+\end{center}
+All coefficients must be finite and nonnegative; zero disables a term
+and reports it as zero. Temporal smoothing is disabled by default to
+preserve mouth transitions, avoiding the original-video encoder pass.
+The two augmented passes are still evaluated. The earlier two-MSE
+objective is recovered with coefficients $(1,1,0,0)$ in the order above.
+
+Console logs report the unweighted components and weighted total.
+Running and epoch summaries are arithmetic means over processed
+batches, rather than a single reduction over all epoch frames or pairs.
+This stage does not produce supervised metrics or learning curves.
 
 \section{Stage I: supervised prediction and regularization}
 
@@ -715,17 +907,26 @@ is active only in the trainable confidence transformations.
 
 \subsection{Optimization procedure}
 
-Stage~I repeatedly constructs the aligned causal predictions and
+When enabled, Stage~0 first minimizes \eqref{eq:pretrain-total} over
+the video encoder, for five epochs by default
+(\texttt{--pretrain-epochs}). It uses the same learning rate,
+weight decay, gradient clipping, and batch size options as Stage~I.
+Pretraining videos must be disjoint from validation videos, including
+source-upload identities when provided; overlap with supervised
+training videos is permitted.
+
+Stage~I then repeatedly constructs the aligned causal predictions and
 minimizes \eqref{eq:stage-one}. An imported language model remains
 fixed unless its fine-tuning is selected. Once prediction training
 finishes, Stage~II constructs \eqref{eq:target-dist}--\eqref{eq:soft-target}
 with the frozen predictor and minimizes \eqref{eq:confidence-loss} over
 the confidence parameters. A batch with no eligible supervised
-positions is skipped for the corresponding stage. Updating the
-prediction parameters changes the distributions defining the
-confidence targets and therefore requires fitting confidence again.
+positions is skipped for the corresponding supervised stage. Updating
+the prediction parameters, including through visual pretraining,
+changes the distributions defining the confidence targets and therefore
+requires fitting confidence again.
 
-Both stages use gradient norm clipping and AdamW, with separate
+All enabled stages use gradient norm clipping and AdamW, with separate
 optimization states. For the active parameter vector $\vartheta$ and
 loss $\mathcal L$, clipping at threshold $c>0$ gives
 \begin{equation}
@@ -749,8 +950,25 @@ are $\beta_1=0.9$, $\beta_2=0.999$, and $\eps_{\mathrm{opt}}=10^{-8}$.
 Frozen parameters and parameters outside the active loss path receive
 no update.
 
+Pretraining saves a checkpoint after each epoch and retains a cumulative
+pretraining epoch count. The option \texttt{--pretrain-only} enables
+Stage~0, sets both supervised epoch counts to zero, and stops after
+pretraining. On resume, omitting the pretraining flags proceeds to the
+supervised stages; supplying them requests additional pretraining with
+the current command's loss settings. If an unannotated-only run deferred
+the learned character vocabulary, it is initialized from the first
+supervised manifest while retaining the video encoder. An imported
+language model's tokenizer is preserved.
+
 \subsection{Optional division into video sections}
 \label{sec:sections}
+
+The same optional \texttt{--max-frames} bound applies to pretraining
+videos. Each section is a separate batch element: temporal pairs in
+\eqref{eq:pretrain-temporal} never cross a section boundary, while
+variance and covariance pool valid frames from all sections present in
+the batch. Visual context and positions restart in each section, with
+the crop still selected from the original video's first frame.
 
 If a video is divided into consecutive sections $[r,s)$, the previous
 equations apply with local frame index $f'=f-r$ and the following
