@@ -1,5 +1,7 @@
 -r requirements.txt
 faster-whisper>=1.1
+# faster-whisper 1.2.1 passes metadata_errors to av.open; PyAV 19 removed it.
+av>=11,<19
 yt-dlp[default]>=2026.8.19
 ijson>=3.3
 huggingface-hub>=0.34

@@ -1209,6 +1209,24 @@ no checkpoint architecture changes; specify it again when resuming training.
 
 ## Troubleshooting
 
+### Whisper audio decoding fails with `metadata_errors`
+
+`TypeError: open() got an unexpected keyword argument 'metadata_errors'` during
+alignment matches a [faster-whisper/PyAV compatibility issue](https://github.com/SYSTRAN/faster-whisper/issues/1589):
+faster-whisper 1.2.1 passes this argument to `av.open()`, but PyAV 19 removed it.
+`requirements-downvid.txt` constrains PyAV to `av>=11,<19` to avoid this combination.
+Repair an existing environment using the same Python that runs training:
+
+```bash
+python3 -m pip install "av>=11,<19"
+```
+
+In a notebook using `!python3 train_downvid.py`, run
+`!python3 -m pip install "av>=11,<19"` first. Restart the kernel if it has already
+imported PyAV or faster-whisper in-process, then rerun the original training
+command. Training flags can stay unchanged; completed downloads and matching
+alignments remain cached.
+
 ### Face detector unavailable
 
 If OpenCV lacks `CascadeClassifier`, install the pinned OpenCV 4.x dependency
