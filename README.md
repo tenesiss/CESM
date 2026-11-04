@@ -162,7 +162,7 @@ is not retried and the crop does not track later head motion or scene changes.
 Crops are resized to `--mouth-size` (default: `96` pixels square), converted to
 RGB, and normalized to `[-1,1]`. Use clips with one visible speaker whose mouth
 stays inside that fixed region. Training and inference read the original video;
-the frame images generated during alignment are preprocessing artifacts.
+alignment saves frame ranges and metadata without exporting frame images.
 Inference restores the checkpoint's crop size and face-detector setting, with
 `--no-face-detector` available as an override.
 
@@ -952,7 +952,6 @@ to select a runtime outside PATH. Authentication can be supplied using
 | `--download-workers 4` | Concurrent HDTF/Shofo downloads; `1` disables download prefetch. TalkVid downloads remain sequential. |
 | `--alignment-workers 4` | Concurrent transcription/frame-alignment jobs, capped by the requested clip count; uses more RAM/VRAM. |
 | `--sequential-alignment` | Force one alignment worker, overriding `--alignment-workers`; downloads can still run in parallel. |
-| `--image-ext jpg` / `--jpeg-quality 95` | Settings for the grouper's saved frame images. |
 | `--reprocess` | Recompute frame alignments while reusing completed downloads. |
 
 Both `train_downvid.py` and `run_all_variants.py` accept `--N-valid` to download
@@ -976,9 +975,10 @@ TalkVid downloads use the metadata's time ranges, with re-encoding at cuts, and 
 audio for Whisper. The script checks the downloaded duration and both media
 streams. Downloads and alignments are cached under `WORK_DIR/clips` and
 `WORK_DIR/frames`; changes to the tokenizer, ASR settings, or grouper code create
-a separate alignment cache. Frame images can occupy substantially more disk
-space than the compressed clips. Metadata is read again on each run, so use a
-local `--metadata` file when remote metadata access is unavailable.
+a separate alignment cache. Alignment stores transcripts and frame ranges;
+it does not export frame images or create per-token folders. Metadata is read
+again on each run, so use a local `--metadata` file when remote metadata access
+is unavailable.
 
 ### Limit clip length
 
@@ -1018,7 +1018,8 @@ the entire attempt budget.
 Prepared transcripts are ASR-generated labels. The grouper uses Whisper word
 timestamps and interpolates character/token boundaries within words; these are
 approximate alignments, not manually verified speech boundaries. Inspect the
-transcripts and grouped frames when diagnosing poor training results.
+transcripts and the corresponding frame ranges in the original videos when
+diagnosing poor training results.
 
 Alignment automatically follows the training tokenizer: one Unicode character
 per group for the default learned encoder, or the exact fast tokenizer from
@@ -1209,6 +1210,36 @@ no checkpoint architecture changes; specify it again when resuming training.
 
 ## Troubleshooting
 
+### Whisper cannot load CUDA libraries on Windows
+
+`Library cublas64_12.dll is not found or cannot be loaded` means Whisper's
+GPU runtime is missing or cannot find a dependency. The NVIDIA driver alone
+does not supply it. [faster-whisper requires CUDA 12 cuBLAS and cuDNN 9](https://github.com/SYSTRAN/faster-whisper#gpu).
+Install the libraries in the Python environment that runs `train_downvid.py`:
+
+```powershell
+python -m pip install nvidia-cublas-cu12 "nvidia-cudnn-cu12>=9,<10"
+```
+
+The wrapper discovers Windows DLL directories in the installed NVIDIA Python
+packages and in PyTorch's `lib` directory for its own process. A system CUDA
+installation can also be used by placing its DLL directory on `PATH`. If the
+CTranslate2 wheel bundles `cudnn64_9.dll`, use a matching cuDNN package version
+if it reports a cuDNN component version mismatch (for example,
+`nvidia-cudnn-cu12==9.10.2.21` for a bundled 9.10.2.21 DLL).
+
+Stop the old run with Ctrl+C and rerun the original command after installation.
+Completed downloads and matching alignments remain cached. The wrapper stops
+on GPU runtime failures during transcription, including lazy segment iteration,
+instead of treating every video as unusable.
+
+For CPU transcription, append `--whisper-device cpu --whisper-compute-type int8`
+to the command. This controls Whisper independently of training's `--device`.
+Check training GPU support with
+`python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`;
+a CPU-only PyTorch build needs to be replaced with a CUDA-enabled build for
+GPU training.
+
 ### Whisper audio decoding fails with `metadata_errors`
 
 `TypeError: open() got an unexpected keyword argument 'metadata_errors'` during
@@ -1249,13 +1280,6 @@ locked temporary files. This addresses a Windows/FFmpeg 8.1 failure where a
 section download could spend its entire 600-second budget draining an audio
 response before seeking to the clip timestamp. Raising `--download-timeout`
 does not address that failure; use the current downloader implementation.
-
-### Unicode frame paths
-
-The frame grouper writes images using Python's Unicode-aware file handling,
-supporting token directories such as `000000_ĠThis`. If an older copy reports
-`Failed to write frame`, update `grouper.py` and restart; completed video downloads
-remain cached and affected alignments are rebuilt automatically.
 
 ### YouTube says “The page needs to be reloaded”
 

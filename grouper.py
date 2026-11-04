@@ -7,16 +7,14 @@ Given:
   - a Hugging Face fast tokenizer
 
 Produces:
-  - one folder per token occurrence
-  - the video frames assigned to that token
   - transcript.txt
   - words.json
-  - manifest.json
+  - manifest.json with token metadata and frame-group windows
   - data.jsonl with video, transcript text, and frame-group windows (CLI)
   - for folder input, one output tree per video plus batch_manifest.json
 
 Important assignment rule:
-  A frame is written to at most one token folder. Overlapping token timestamps
+  A frame is assigned to at most one token group. Overlapping token timestamps
   move the group boundary to the frame containing the later token's start.
   Otherwise, the next group begins after the previous token ends, absorbing any
   intervening silence. Boundaries never move backward; equal starts favor the
@@ -33,9 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import sys
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -99,7 +95,6 @@ class TokenSpan:
     frame_count: int = 0
     first_frame: Optional[int] = None
     last_frame: Optional[int] = None
-    folder: str = ""
 
 
 def transcribe_words(
@@ -293,14 +288,6 @@ def align_tokens(
     return spans
 
 
-def _safe_name(text: str, max_len: int = 48) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = text.replace("\n", "_").replace("\r", "_").replace("\t", "_")
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
-    text = re.sub(r"\s+", "_", text).strip("._")
-    return (text or "token")[:max_len]
-
-
 def _build_group_starts(
     spans: list[TokenSpan],
     fps: float,
@@ -381,11 +368,9 @@ def save_grouped_frames(
     output_dir: str | Path,
     *,
     transcript: Optional[str] = None,
-    image_ext: str = "jpg",
-    jpeg_quality: int = 95,
 ) -> dict[str, Any]:
     """
-    Save frames into strictly non-overlapping, contiguous token groups.
+    Save non-overlapping token frame ranges and metadata, without image files.
 
     manifest["groups"] has one inclusive [start_frame, end_frame] pair per
     token occurrence and is indexed exactly like manifest["tokens"].
@@ -393,83 +378,29 @@ def save_grouped_frames(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    token_root = output_dir / "tokens"
-    token_root.mkdir(parents=True, exist_ok=True)
-
-    for span in spans:
-        label = _safe_name(span.token)
-        folder_name = f"{span.index:06d}_{label}"
-        span.folder = str(Path("tokens") / folder_name)
-        (output_dir / span.folder).mkdir(parents=True, exist_ok=True)
-
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    if not math.isfinite(fps) or fps <= 0:
-        cap.release()
-        raise RuntimeError("Video FPS is missing or invalid.")
-
-    total_frames_reported = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    ext = image_ext.lower().lstrip(".")
-    if ext not in {"jpg", "jpeg", "png"}:
-        cap.release()
-        raise ValueError("--image-ext must be jpg, jpeg, or png")
-
-    group_starts = _build_group_starts(spans, fps)
-    last_speech_end_frame = int(math.ceil(spans[-1].time_end * fps)) - 1
-
-    frame_index = 0
-    group_index = 0
-    assigned_frames = 0
-    encode_params = [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)] if ext in {"jpg", "jpeg"} else []
-
+    frames_decoded = 0
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {video_path}")
 
-            # Advance through every token whose group has started. Using <= here
-            # means equal start frames are resolved in favor of the later token.
-            while (
-                group_index + 1 < len(group_starts)
-                and group_starts[group_index + 1] <= frame_index
-            ):
-                group_index += 1
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        if not math.isfinite(fps) or fps <= 0:
+            raise RuntimeError("Video FPS is missing or invalid.")
 
-            if spans and frame_index <= last_speech_end_frame:
-                chosen = spans[group_index]
-                out_path = (
-                    output_dir
-                    / chosen.folder
-                    / f"frame_{frame_index:09d}.{ext}"
-                )
+        total_frames_reported = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-                try:
-                    # OpenCV's imwrite cannot reliably open Unicode paths on
-                    # Windows (e.g. a tokenizer's ĠThis folder). Let OpenCV
-                    # encode the image and Python handle the filesystem path.
-                    encoded_ok, encoded = cv2.imencode(f".{ext}", frame, encode_params)
-                    if not encoded_ok:
-                        raise RuntimeError(f"Failed to encode frame: {out_path}")
-                    out_path.write_bytes(encoded.tobytes())
-                except (cv2.error, OSError) as exc:
-                    raise RuntimeError(f"Failed to write frame: {out_path}: {exc}") from exc
-
-                assigned_frames += 1
-
-            frame_index += 1
+        # Count actual frames, as the trainer does, without retrieving or
+        # encoding their pixels. Container frame counts can be inaccurate.
+        while cap.grab():
+            frames_decoded += 1
     finally:
         cap.release()
 
-    frames_decoded = frame_index
-
     groups = _build_inclusive_groups(spans, fps, frames_decoded)
+    assigned_frames = sum(end - start + 1 for start, end in groups)
 
     # Derive token frame metadata from the exact same ranges exposed in groups.
     for span, (group_start, group_end) in zip(spans, groups):
@@ -494,7 +425,7 @@ def save_grouped_frames(
             "for that token."
         ),
         "frame_assignment_policy": (
-            "A source frame is written at most once. If adjacent spoken-token "
+            "A source frame is assigned at most once. If adjacent spoken-token "
             "windows overlap a source frame, the later token gets that frame. "
             "Silence between tokens is preferentially attached to the next "
             "token. Group 0 begins at frame 0; video after the final spoken "
@@ -518,7 +449,6 @@ def save_grouped_frames(
                 "frame_count": span.frame_count,
                 "first_frame": span.first_frame,
                 "last_frame": span.last_frame,
-                "folder": span.folder,
             }
             for span in spans
         ],
@@ -539,12 +469,10 @@ def group_frames_by_token(
     language: Optional[str] = None,
     device: str = "auto",
     compute_type: str = "default",
-    image_ext: str = "jpg",
-    jpeg_quality: int = 95,
     whisper_instance: Optional[WhisperModel] = None,
 ) -> dict[str, Any]:
     """
-    Transcribe, align and save one video's token frames and metadata.
+    Transcribe, align and save one video's token frame ranges and metadata.
 
     Example:
         from transformers import AutoTokenizer
@@ -605,8 +533,6 @@ def group_frames_by_token(
         spans,
         output_dir,
         transcript=transcript,
-        image_ext=image_ext,
-        jpeg_quality=jpeg_quality,
     )
 
 
@@ -684,8 +610,6 @@ def group_folder_by_token(
     language: Optional[str] = None,
     device: str = "auto",
     compute_type: str = "default",
-    image_ext: str = "jpg",
-    jpeg_quality: int = 95,
 ) -> dict[str, Any]:
     """
     Process every recognized video in a directory.
@@ -729,8 +653,6 @@ def group_folder_by_token(
                 language=language,
                 device=device,
                 compute_type=compute_type,
-                image_ext=image_ext,
-                jpeg_quality=jpeg_quality,
                 whisper_instance=whisper_instance,
             )
         except Exception as exc:
@@ -834,28 +756,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "int8_float16"
         ),
     )
-    parser.add_argument(
-        "--image-ext",
-        default="jpg",
-        choices=["jpg", "jpeg", "png"],
-        help="Saved frame format (default: jpg)",
-    )
-    parser.add_argument(
-        "--jpeg-quality",
-        type=int,
-        default=95,
-        help="JPEG quality 0-100 (default: 95)",
-    )
-
     return parser
 
 
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
-
-    if not 0 <= args.jpeg_quality <= 100:
-        raise SystemExit("--jpeg-quality must be between 0 and 100")
 
     input_path = Path(args.input)
     try:
@@ -875,8 +781,6 @@ def main() -> None:
             language=args.language,
             device=args.device,
             compute_type=args.compute_type,
-            image_ext=args.image_ext,
-            jpeg_quality=args.jpeg_quality,
         )
         print(
             f"Batch complete: {batch_manifest['videos_succeeded']} succeeded, "
@@ -899,8 +803,6 @@ def main() -> None:
             language=args.language,
             device=args.device,
             compute_type=args.compute_type,
-            image_ext=args.image_ext,
-            jpeg_quality=args.jpeg_quality,
         )
         jsonl_path = write_jsonl(
             [_jsonl_record(manifest)],

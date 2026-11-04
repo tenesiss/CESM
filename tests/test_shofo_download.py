@@ -293,6 +293,29 @@ class ShofoPipelineTests(PipelineFixture):
         self.assertNotIn("test-secret", json.dumps(report))
         self.assertFalse(list(self.root.glob("clips/**/download.json")))
 
+    def test_ffmpeg_option_failure_stops_after_first_clip_and_reports_reason(self):
+        args = self.shofo_args("-N", "2", "--start-index", "1", "--download-workers", "1",
+                               "--download-max-frames", "12", "--max-attempts", "50")
+        args.manifest.write_text("previous manifest\n")
+
+        def fail(command, **kwargs):
+            kwargs["stdout"].write("Unrecognized option 'vsync'.\n"
+                                   "Error splitting the argument list: Option not found\n")
+            raise subprocess.CalledProcessError(2880417800, command)
+
+        with patch.object(pipeline, "run_download_process", side_effect=fail) as run:
+            with self.assertRaisesRegex(pipeline.DownloadSetupError, "Unrecognized option 'vsync'"):
+                pipeline.prepare(args, video_only=True)
+        run.assert_called_once()
+        self.assertEqual(self.transfer.call_count, 1)
+        self.assertEqual(args.manifest.read_text(), "previous manifest\n")
+        report = pipeline.read_cache(self.root / "pretrain_report.json")
+        self.assertEqual((report["usable"], report["attempts"]), (0, 1))
+        self.assertIn("Unrecognized option 'vsync'", report["failures"][0]["error"])
+        self.assertIn("download.log", report["failures"][0]["error"])
+        self.assertFalse(list(self.root.glob("clips/**/download.json")))
+        self.assertFalse(list(self.root.glob("clips/**/download-*")))
+
 
 if __name__ == "__main__":
     unittest.main()

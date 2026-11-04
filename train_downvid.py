@@ -33,6 +33,7 @@ import zipfile
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
@@ -138,9 +139,6 @@ def build_argparser():
     group.add_argument("--whisper-device", choices=["auto", "cpu", "cuda"], default="auto",
                        help="Whisper device, independent of training --device")
     group.add_argument("--whisper-compute-type", default="default")
-    group.add_argument("--image-ext", choices=["jpg", "jpeg", "png"], default="jpg")
-    group.add_argument("--jpeg-quality", type=int, choices=range(1, 101), default=95,
-                       metavar="1..100")
     group.add_argument("--reprocess", action="store_true",
                        help="Recompute alignments even when a matching cached result exists")
     group.add_argument("--prepare-only", action="store_true",
@@ -407,6 +405,7 @@ def download_hosted_clip(clip, args, dataset, description, copy_source):
     if cached is not None:
         print(f"  Reusing download: {cached}", flush=True)
         return cached
+    sync_args = ffmpeg_passthrough_args() if args.download_max_frames is not None else ()
     folder = download_folder(clip, args)
     folder.mkdir(parents=True, exist_ok=True)
     video = folder / "video.mp4"
@@ -426,11 +425,15 @@ def download_hosted_clip(clip, args, dataset, description, copy_source):
                         "ffmpeg", "-v", "error", "-y", "-i", str(source),
                         "-map", "0:v:0", "-map", "0:a:0",
                         "-vf", f"trim=end_frame={args.download_max_frames},setpts=PTS-STARTPTS",
-                        "-af", "asetpts=PTS-STARTPTS", "-vsync", "0", "-shortest",
+                        "-af", "asetpts=PTS-STARTPTS", *sync_args, "-shortest",
                         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac",
                         str(output),
                     ]
-                    run_download_process(command, stdout=stream, timeout=args.download_timeout)
+                    try:
+                        run_download_process(command, stdout=stream, timeout=args.download_timeout)
+                    except subprocess.CalledProcessError as exc:
+                        stream.flush()
+                        raise download_process_error(log, exc.returncode) from exc
                     probe_video(output, duration, max_frames=args.download_max_frames)
                 output.replace(video)
             except (OSError, ValueError, RuntimeError, zipfile.BadZipFile,
@@ -506,8 +509,29 @@ def validate_download_runtimes(args):
     print(f"YouTube JavaScript runtime: {', '.join(descriptions)}", flush=True)
 
 
+@lru_cache(maxsize=1)
+def ffmpeg_passthrough_args():
+    """Prefer fps_mode, retaining support for FFmpeg builds before it existed."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-h", "full"],
+            capture_output=True, text=True, errors="replace", check=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DownloadSetupError(f"Cannot inspect FFmpeg options: {exc}") from exc
+    help_text = result.stdout + result.stderr
+    # New releases removed vsync; older releases do not have fps_mode.
+    for option, value in (("-fps_mode", "passthrough"), ("-vsync", "0")):
+        if re.search(rf"^\s*{re.escape(option)}(?:\s|\[)", help_text, re.M):
+            return (option, value)
+    raise DownloadSetupError(
+        "FFmpeg supports neither -fps_mode nor -vsync. Install a full FFmpeg build "
+        "and make it available on PATH before using --download-max-frames."
+    )
+
+
 def download_process_error(log, returncode):
-    """Expose yt-dlp's reason and distinguish dead uploads from setup failures."""
+    """Expose downloader/FFmpeg diagnostics and distinguish setup failures."""
     try:
         with log.open("rb") as stream:
             stream.seek(0, 2)
@@ -517,20 +541,20 @@ def download_process_error(log, returncode):
         tail = ""
     tail = re.sub(r"\x1b\[[0-9;]*m", "", tail)
     errors = [line.strip() for line in tail.splitlines() if re.search(r"(?:^|: )error:", line, re.I)]
-    reason = errors[-1] if errors else f"process exited with status {returncode}"
+    lines = [line.strip() for line in tail.splitlines() if line.strip()]
+    reason = (errors or lines or [f"process exited with status {returncode}"])[-1]
     message = f"Download failed ({reason}); details: {log}"
     lower = reason.lower().replace("’", "'")
-    if "ffmpeg exited with code" in lower:
-        # FFmpeg writes its own diagnostics without yt-dlp's ERROR: prefix.
-        # An unsupported local option will fail for every source video.
-        option_errors = re.findall(r"^Unrecognized option .+$", tail, re.M)
-        if option_errors:
-            return DownloadSetupError(
-                f"Download failed ({option_errors[-1].strip()}); details: {log}. "
-                "The installed FFmpeg does not support a download option. "
-                "Use the updated train_downvid.py or update FFmpeg. "
-                "Stopping instead of spending more clip attempts."
-            )
+    # Direct FFmpeg invocations have no yt-dlp ERROR: wrapper. In either case,
+    # an unsupported local option will fail for every source video.
+    option_errors = re.findall(r"^Unrecognized option .+$", tail, re.M)
+    if option_errors:
+        return DownloadSetupError(
+            f"Download failed ({option_errors[-1].strip()}); details: {log}. "
+            "The installed FFmpeg does not support a download option. "
+            "Use the updated train_downvid.py or update FFmpeg. "
+            "Stopping instead of spending more clip attempts."
+        )
     if "page needs to be reloaded" in lower:
         return DownloadSetupError(
             f"{message}. YouTube's player/session request failed; this does not establish that "
@@ -681,11 +705,10 @@ def download_clip(clip, args):
             # Apply the limit while FFmpeg reads the remote section. Counting
             # decoded frames avoids estimating a duration from possibly VFR video.
             # trim signals video EOF; shortest limits audio to the video duration.
-            # -vsync 0 requests timestamp passthrough on FFmpeg versions that
-            # predate -fps_mode passthrough.
+            sync_options = " ".join(ffmpeg_passthrough_args())
             command.extend([
                 "--downloader", "ffmpeg", "--downloader-args",
-                f"ffmpeg_o:-vf trim=end_frame={args.download_max_frames} -vsync 0 -shortest",
+                f"ffmpeg_o:-vf trim=end_frame={args.download_max_frames} {sync_options} -shortest",
             ])
         for flag, value in [("--cookies", args.cookies),
                             ("--cookies-from-browser", args.cookies_from_browser),
@@ -766,7 +789,32 @@ def alignment_tokenizer(args):
     return CharacterAlignmentTokenizer(), "character", {"type": "character"}, resume_chars
 
 
+@lru_cache(maxsize=1)
+def configure_whisper_dll_paths():
+    """Expose installed NVIDIA/PyTorch DLLs to CTranslate2 on Windows."""
+    if sys.platform != "win32":
+        return ()
+    directories = []
+    for package in ("nvidia", "torch"):
+        spec = importlib.util.find_spec(package)
+        roots = (spec.submodule_search_locations or ()) if spec is not None else ()
+        for root in roots:
+            root = Path(root)
+            candidates = ([root / "lib"] if package == "torch" else
+                          [path for child in sorted(root.iterdir()) if child.is_dir()
+                           for path in (child / "bin", child / "lib")])
+            directories.extend(str(path.resolve()) for path in candidates if path.is_dir())
+    directories = list(dict.fromkeys(directories))
+    # CTranslate2 also uses native LoadLibrary calls, which consult PATH rather
+    # than Python's DLL search directories. Keep directory handles alive too.
+    handles = tuple(os.add_dll_directory(path) for path in directories)
+    if directories:
+        os.environ["PATH"] = os.pathsep.join([*directories, os.environ.get("PATH", "")])
+    return handles
+
+
 def load_grouper(path):
+    configure_whisper_dll_paths()
     spec = importlib.util.spec_from_file_location("_cesm_frame_grouper", path)
     module = importlib.util.module_from_spec(spec)
     # dataclasses resolves the class module through sys.modules.
@@ -962,7 +1010,7 @@ class ClipAligner:
                         compute_type=self.args.whisper_compute_type, **options,
                     )
                 except Exception as exc:
-                    self.setup_error = f"Cannot initialize Whisper: {exc}"
+                    self.setup_error = whisper_setup_message(exc)
                     raise WhisperSetupError(self.setup_error) from exc
             return self.local.tokenizer, self.whisper
 
@@ -998,12 +1046,20 @@ class ClipAligner:
         if output.exists():
             shutil.rmtree(output)
         print(f"  Transcribing and grouping frames: {video}", flush=True)
-        manifest = grouper.group_frames_by_token(
-            video, tokenizer, output, whisper_model=args.whisper_model,
-            language=args.language, device=args.whisper_device,
-            compute_type=args.whisper_compute_type, image_ext=args.image_ext,
-            jpeg_quality=args.jpeg_quality, whisper_instance=whisper,
-        )
+        try:
+            manifest = grouper.group_frames_by_token(
+                video, tokenizer, output, whisper_model=args.whisper_model,
+                language=args.language, device=args.whisper_device,
+                compute_type=args.whisper_compute_type, whisper_instance=whisper,
+            )
+        except (OSError, RuntimeError) as exc:
+            # Whisper loads some CUDA libraries only during inference (including
+            # lazy segment iteration). Such failures affect every clip.
+            if not is_whisper_runtime_error(exc):
+                raise
+            with self.lock:
+                self.setup_error = whisper_setup_message(exc)
+            raise WhisperSetupError(self.setup_error) from exc
         record = training_record(manifest, tokenizer, self.unit, video)
         record["source_key"] = clip.source_key
         grouper.write_jsonl([record], output / "data.jsonl")
@@ -1098,8 +1154,7 @@ def prepare(args, *, video_only=False, validation=False, exclude_manifests=()):
         config = {"version": 1, "tokenizer": token_state,
                   "grouper_sha256": hashlib.sha256(args.group_frames_code.read_bytes()).hexdigest(),
                   "whisper_model": args.whisper_model, "language": args.language,
-                  "device": args.whisper_device, "compute_type": args.whisper_compute_type,
-                  "image_ext": args.image_ext, "jpeg_quality": args.jpeg_quality}
+                  "device": args.whisper_device, "compute_type": args.whisper_compute_type}
         if args.download_max_frames is not None:
             config["download_max_frames"] = args.download_max_frames
         aligner = ClipAligner(args, grouper, tokenizer, unit, config, alignment_workers)
@@ -1186,6 +1241,29 @@ class AlignmentSetupError(RuntimeError):
 
 class WhisperSetupError(AlignmentSetupError):
     pass
+
+
+def is_whisper_runtime_error(exc):
+    message = str(exc).lower()
+    runtime = any(name in message for name in ("cuda", "cublas", "cudnn", "nvrtc"))
+    failure = any(text in message for text in (
+        "not found", "cannot be loaded", "could not load", "cannot load", "unable to load",
+        "failed to load", "no such file", "cannot open shared object", "failed with",
+        "driver version is insufficient", "out of memory",
+    ))
+    return runtime and failure
+
+
+def whisper_setup_message(exc):
+    message = f"Cannot initialize Whisper: {exc}"
+    if is_whisper_runtime_error(exc):
+        message += (
+            ". Whisper's GPU runtime failed. For missing libraries, install cuBLAS for CUDA 12 "
+            "and cuDNN 9 for CUDA 12 and make them discoverable (see README troubleshooting). "
+            "To transcribe on CPU, use --whisper-device cpu --whisper-compute-type int8. "
+            "Stopping instead of skipping more clips; completed downloads and alignments are cached."
+        )
+    return message
 
 
 def training_command(args):

@@ -367,6 +367,53 @@ class ParallelDownloadTests(PipelineFixture):
         self.assertEqual(report["usable"], 0)
         self.assertIn("unavailable device", report["failures"][0]["error"])
 
+    def test_inference_runtime_failure_stops_without_skipping_to_another_clip(self):
+        args = self.args("-N", "4", "--alignment-workers", "1", "--download-workers", "1")
+        args.manifest.write_text("previous manifest\n")
+        messages = (
+            "Library cublas64_12.dll is not found or cannot be loaded",
+            "Could not load library cudnn_ops64_9.dll",
+            "libcublas.so.12: cannot open shared object file: No such file or directory",
+        )
+        for message in messages:
+            with self.subTest(message=message), self.alignment_fixture() as (grouper, _, download):
+                grouper.group_frames_by_token.side_effect = RuntimeError(message)
+                with self.assertRaisesRegex(pipeline.WhisperSetupError, "--whisper-device cpu"):
+                    pipeline.prepare(args)
+                grouper.group_frames_by_token.assert_called_once()
+                download.assert_called_once()
+                self.assertEqual(args.manifest.read_text(), "previous manifest\n")
+                self.assertFalse(list(self.root.glob("frames/**/complete.json")))
+                report = pipeline.read_cache(self.root / "run_report.json")
+                self.assertEqual((report["attempts"], report["usable"]), (1, 0))
+                self.assertIn(message, report["failures"][0]["error"])
+
+    def test_inference_runtime_failure_is_remembered_by_alignment_workers(self):
+        args = self.args("-N", "4")
+        with self.alignment_fixture() as (grouper, tokenizer, _):
+            grouper.group_frames_by_token.side_effect = OSError("Could not load library cudnn_ops64_9.dll")
+            aligner = pipeline.ClipAligner(args, grouper, tokenizer, "character", {}, workers=2)
+            clip = self.rows[0]["clip"]
+            with self.assertRaises(pipeline.WhisperSetupError):
+                aligner(clip, self.video(clip))
+            # A subsequent worker must fail before reusing the broken model.
+            with self.assertRaises(pipeline.AlignmentSetupError):
+                aligner.resources(model=True)
+            grouper.WhisperModel.assert_called_once()
+            grouper.group_frames_by_token.assert_called_once()
+
+    def test_no_speech_remains_a_per_clip_failure(self):
+        args = self.args("-N", "1", "--alignment-workers", "1", "--download-workers", "1")
+
+        def align(video, tokenizer, **kwargs):
+            if video.name == "0.mp4":
+                raise RuntimeError("No timestamped speech was found in the video.")
+
+        with self.alignment_fixture(align) as (_, _, download):
+            pipeline.prepare(args)
+        self.assertEqual(download.call_count, 2)
+        self.assertEqual([row["source_key"] for row in self.records(args)], ["tiktok:1"])
+
     def test_prefetch_respects_selection_deduplication_and_exclusions(self):
         args = self.args("-N", "2", "--download-workers", "4", "--start-index", "1",
                          "--dataset-language", "en")

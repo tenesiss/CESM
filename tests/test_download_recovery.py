@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import PropertyMock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import cv2
 import numpy as np
@@ -139,8 +139,6 @@ class DownloadFrameLimitIntegrationTests(PipelineFixture):
             start, end = map(float, command[command.index("--download-sections") + 1][1:].split("-"))
             options = command[command.index("--downloader-args") + 1]
             self.assertTrue(options.startswith("ffmpeg_o:"))
-            self.assertNotIn("-fps_mode", options)
-            self.assertIn("-vsync 0", options)
             output = command[command.index("--output") + 1].replace("%(ext)s", "mp4")
             input_options = next(value for value in command if value.startswith("ffmpeg_i:"))
             return run_process([
@@ -182,49 +180,39 @@ class GrouperIntegrationTests(PipelineFixture):
         self.words = [self.grouper.WordSpan("hi", 0, 2, 0.1, 0.8)]
 
 
-    def test_grouped_frames_support_unicode_folders_in_all_image_formats(self):
-        for ext in ("jpg", "jpeg", "png"):
-            with self.subTest(ext=ext):
-                output = self.root / "r\u00e9sultats_\u4e2d" / ext
-                spans = [
-                    self.grouper.TokenSpan(0, 1, "\u0120This", "This", 0, 4, 0, 0.4),
-                    self.grouper.TokenSpan(1, 2, "\u2581works", " works", 4, 10, 0.4, 0.8),
-                ]
-                manifest = self.grouper.save_grouped_frames(
-                    self.video, spans, output, transcript="This works",
-                    image_ext=ext, jpeg_quality=37,
-                )
-                self.assertEqual(manifest["groups"], [[0, 4], [5, 9]])
-                self.assertEqual(manifest["frames_decoded"], 12)
-                self.assertEqual(manifest["frames_assigned_to_tokens"], 10)
-                for token, (start, end) in zip(manifest["tokens"], manifest["groups"]):
-                    folder = output / token["folder"]
-                    self.assertIn(token["token"], folder.name)
-                    files = sorted(folder.glob(f"*.{ext}"))
-                    self.assertEqual([file.name for file in files],
-                                     [f"frame_{i:09d}.{ext}" for i in range(start, end + 1)])
-                    for index, file in enumerate(files, start):
-                        # Decode bytes through Python too: imread has the same
-                        # Unicode filename limitation as imwrite on Windows.
-                        frame = cv2.imdecode(np.frombuffer(file.read_bytes(), dtype=np.uint8),
-                                             cv2.IMREAD_COLOR)
-                        self.assertIsNotNone(frame)
-                        self.assertEqual(frame.shape, (32, 32, 3))
-                        self.assertLessEqual(np.abs(frame.astype(int) - index * 15).max(), 3)
-                self.assertEqual(pipeline.read_cache(output / "manifest.json"), manifest)
+    def test_frame_groups_save_only_metadata_in_unicode_output_path(self):
+        output = self.root / "r\u00e9sultats_\u4e2d"
+        spans = [
+            self.grouper.TokenSpan(0, 1, "\u0120This", "This", 0, 4, 0, 0.4),
+            self.grouper.TokenSpan(1, 2, "\u2581works", " works", 4, 10, 0.4, 0.8),
+        ]
+        with patch.object(self.grouper.cv2, "imencode", side_effect=AssertionError("image encoded")), \
+                patch.object(Path, "write_bytes", side_effect=AssertionError("image written")):
+            manifest = self.grouper.save_grouped_frames(
+                self.video, spans, output, transcript="This works",
+            )
+        self.assertEqual(manifest["groups"], [[0, 4], [5, 9]])
+        self.assertEqual(manifest["frames_decoded"], 12)
+        self.assertEqual(manifest["frames_assigned_to_tokens"], 10)
+        for token, (start, end) in zip(manifest["tokens"], manifest["groups"]):
+            self.assertEqual(token["first_frame"], start)
+            self.assertEqual(token["last_frame"], end)
+            self.assertEqual(token["frame_count"], end - start + 1)
+            self.assertNotIn("folder", token)
+        self.assertEqual(list(output.rglob("*")), [output / "manifest.json"])
+        self.assertEqual(pipeline.read_cache(output / "manifest.json"), manifest)
 
 
-    def test_frame_write_error_includes_path_and_releases_video(self):
-        output = self.root / "write-failure"
+    def test_frame_count_error_releases_video(self):
+        output = self.root / "decode-failure"
         spans = [self.grouper.TokenSpan(0, 1, "This", "This", 0, 4, 0, 0.8)]
         cap = cv2.VideoCapture(str(self.video))
         self.addCleanup(cap.release)
-        with patch.object(self.grouper.cv2, "VideoCapture", return_value=cap), \
-                patch.object(Path, "write_bytes", side_effect=PermissionError(13, "Permission denied")):
-            with self.assertRaisesRegex(RuntimeError, "Failed to write frame:.*Permission denied") as caught:
+        capture = Mock(wraps=cap)
+        capture.grab.side_effect = RuntimeError("Decoder failed")
+        with patch.object(self.grouper.cv2, "VideoCapture", return_value=capture):
+            with self.assertRaisesRegex(RuntimeError, "Decoder failed"):
                 self.grouper.save_grouped_frames(self.video, spans, output)
-        self.assertIn("frame_000000000.jpg", str(caught.exception))
-        self.assertIsInstance(caught.exception.__cause__, PermissionError)
         self.assertFalse(cap.isOpened())
         self.assertFalse((output / "manifest.json").exists())
 

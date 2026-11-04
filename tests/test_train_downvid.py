@@ -242,22 +242,53 @@ class PipelineTests(PipelineFixture):
 
     def test_ffmpeg_option_error_exposes_underlying_reason_and_stops_run(self):
         log = self.root / "download.log"
-        log.write_text(
-            "WARNING: [youtube] No supported JavaScript runtime could be found.\n"
-            "Unrecognized option 'fps_mode'.\n"
-            "Error splitting the argument list: Option not found\n"
-            "ERROR: ffmpeg exited with code 1\n",
-            encoding="utf-8",
-        )
-        error = pipeline.download_process_error(log, 1)
-        self.assertIs(type(error), pipeline.DownloadSetupError)
-        self.assertIn("Unrecognized option 'fps_mode'", str(error))
-        self.assertIn(str(log), str(error))
+        for option, wrapper, code in (("fps_mode", "ERROR: ffmpeg exited with code 1\n", 1),
+                                      ("vsync", "", 2880417800)):
+            with self.subTest(option=option):
+                log.write_text(
+                    f"Unrecognized option '{option}'.\n"
+                    "Error splitting the argument list: Option not found\n" + wrapper,
+                    encoding="utf-8",
+                )
+                error = pipeline.download_process_error(log, code)
+                self.assertIs(type(error), pipeline.DownloadSetupError)
+                self.assertIn(f"Unrecognized option '{option}'", str(error))
+                self.assertIn(str(log), str(error))
 
         # Other FFmpeg failures can be specific to the clip and remain skippable.
         log.write_text("Invalid data found when processing input\nERROR: ffmpeg exited with code 1\n",
                        encoding="utf-8")
         self.assertIs(type(pipeline.download_process_error(log, 1)), RuntimeError)
+        log.write_text("Invalid data found when processing input\n", encoding="utf-8")
+        error = pipeline.download_process_error(log, 1)
+        self.assertIs(type(error), RuntimeError)
+        self.assertIn("Invalid data found", str(error))
+
+    def test_ffmpeg_passthrough_supports_new_and_legacy_builds(self):
+        self.addCleanup(pipeline.ffmpeg_passthrough_args.cache_clear)
+        for help_text, expected in (
+            ("-fps_mode[:<stream_spec>]  set framerate mode\n", ("-fps_mode", "passthrough")),
+            ("-vsync sync_method  video sync method\n", ("-vsync", "0")),
+            ("-vsync sync_method  video sync method\n-fps_mode mode  set framerate mode\n",
+             ("-fps_mode", "passthrough")),
+        ):
+            with self.subTest(expected=expected):
+                pipeline.ffmpeg_passthrough_args.cache_clear()
+                result = subprocess.CompletedProcess([], 0, help_text, "")
+                with patch.object(pipeline.subprocess, "run", return_value=result) as run:
+                    self.assertEqual(pipeline.ffmpeg_passthrough_args(), expected)
+                    self.assertEqual(pipeline.ffmpeg_passthrough_args(), expected)
+                run.assert_called_once()
+
+    def test_ffmpeg_inspection_failure_is_a_setup_error(self):
+        pipeline.ffmpeg_passthrough_args.cache_clear()
+        self.addCleanup(pipeline.ffmpeg_passthrough_args.cache_clear)
+        with patch.object(pipeline.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            with self.assertRaisesRegex(pipeline.DownloadSetupError, "neither"):
+                pipeline.ffmpeg_passthrough_args()
+        with patch.object(pipeline.subprocess, "run", side_effect=subprocess.TimeoutExpired("ffmpeg", 10)):
+            with self.assertRaisesRegex(pipeline.DownloadSetupError, "Cannot inspect FFmpeg"):
+                pipeline.ffmpeg_passthrough_args()
 
     def test_download_limits_use_separate_caches_and_validate_frame_count(self):
         clip = pipeline.Clip.from_row(self.row())
@@ -268,6 +299,7 @@ class PipelineTests(PipelineFixture):
             Path(template.replace("%(ext)s", "mp4")).write_bytes(b"fake downloaded video")
 
         with patch.object(pipeline, "run_download_process", side_effect=download) as run, \
+                patch.object(pipeline, "ffmpeg_passthrough_args", return_value=("-fps_mode", "passthrough")), \
                 patch.object(pipeline, "probe_video") as probe:
             for limit in (None, 12, 24):
                 args = self.args(*([] if limit is None else ["--download-max-frames", str(limit)]))
@@ -511,8 +543,6 @@ class DownloadFrameLimitIntegrationTests(PipelineFixture):
             start, end = map(float, command[command.index("--download-sections") + 1][1:].split("-"))
             options = command[command.index("--downloader-args") + 1]
             self.assertTrue(options.startswith("ffmpeg_o:"))
-            self.assertNotIn("-fps_mode", options)
-            self.assertIn("-vsync 0", options)
             output = command[command.index("--output") + 1].replace("%(ext)s", "mp4")
             return run_process([
                 "ffmpeg", "-v", "error", "-y", "-ss", str(start), "-t", str(end - start),
@@ -807,6 +837,9 @@ class GrouperIntegrationTests(PipelineFixture):
         tokenizer = train.CharTokenizer.build(row["text"] for row in records)
         dataset = train.VideoTextWindowDataset(records, tokenizer, 16, use_face_detector=False)
         self.assertEqual(dataset[0]["video"].shape[0], 12)
+        self.assertFalse(list((self.root / "frames").rglob("tokens")))
+        self.assertTrue(all(path.suffix in {".json", ".jsonl", ".txt"}
+                            for path in (self.root / "frames").rglob("*") if path.is_file()))
         self.assertEqual(self.prepare_with_fixtures(args, rows, downloader), 0)
         args.language = "en"
         self.assertEqual(self.prepare_with_fixtures(args, rows, downloader), 2)
@@ -980,10 +1013,13 @@ class GrouperIntegrationTests(PipelineFixture):
             else:
                 train.train(train.build_argparser().parse_args(command[2:]))
 
+        find_spec = importlib.util.find_spec
         threads = torch.get_num_threads()
         try:
             torch.set_num_threads(1)
-            with patch.object(pipeline.importlib.util, "find_spec", return_value=object()), \
+            # Keep real module specs for PyTorch's lazy optimizer imports.
+            with patch.object(pipeline.importlib.util, "find_spec", side_effect=lambda name:
+                              object() if name in ("faster_whisper", "yt_dlp", "ijson") else find_spec(name)), \
                     patch.object(pipeline, "validate_download_runtimes"), \
                     patch.object(pipeline.shutil, "which", return_value="tool"), \
                     patch.object(pipeline, "iter_metadata", side_effect=lambda _: (row for row in metadata)), \
